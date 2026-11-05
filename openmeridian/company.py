@@ -1,0 +1,744 @@
+"""Everything a company does. Every public method is one transaction: it all happens, or none of it does.
+No GUI here: this module is what the window, the command line and the tests all use."""
+from __future__ import annotations
+
+import getpass
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+from . import db
+from .values import QTY_SCALE, fmt_money, fmt_qty, line_total
+
+
+class ERPError(ValueError):
+    """Something the user can act on. The message is written for them."""
+
+
+def today() -> str:
+    return date.today().isoformat()
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _user() -> str:
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError, ImportError):
+        return ""
+
+
+def _clean(text) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _date(text, what="date") -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    try:
+        return date.fromisoformat(s).isoformat()
+    except ValueError:
+        raise ERPError(f"Enter the {what} as YYYY-MM-DD.") from None
+
+
+KINDS = ("buy", "make")
+DEFAULT_SETTINGS = {"company_name": "", "currency": "$", "tax_percent": "0", "address": "", "rw_workspace": ""}
+PREFIX = {"so": "SO", "po": "PO", "wo": "WO", "inv": "INV"}
+
+
+class Company:
+    def __init__(self, conn: sqlite3.Connection, path: str):
+        self.conn, self.path = conn, path
+        self._depth = 0
+        self.user = _user()
+
+    # ---- opening
+    @classmethod
+    def create(cls, path: str, name: str) -> "Company":
+        name = _clean(name)
+        if not name:
+            raise ERPError("Enter a company name.")
+        c = cls(db.create(path), path)
+        with c.tx():
+            for k, v in DEFAULT_SETTINGS.items():
+                c.conn.execute("INSERT INTO settings VALUES (?, ?)", (k, name if k == "company_name" else v))
+            c._log("company.create", name)
+        return c
+
+    @classmethod
+    def open(cls, path: str) -> "Company":
+        return cls(db.open_existing(path), path)
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def backup(self, dest: str) -> None:
+        db.backup(self.conn, dest)
+
+    @contextmanager
+    def tx(self):
+        if self._depth:
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            raise ERPError(f"The company file is busy in another window. Try again in a moment.\n\n{e}") from e
+        self._depth = 1
+        try:
+            yield
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        else:
+            self.conn.execute("COMMIT")
+        finally:
+            self._depth = 0
+
+    def _log(self, action: str, detail: str = "") -> None:
+        self.conn.execute("INSERT INTO audit (time, user, action, detail) VALUES (?, ?, ?, ?)",
+                          (_now(), self.user, action, detail))
+
+    def _next(self, seq: str) -> str:
+        row = self.conn.execute("SELECT last FROM sequences WHERE name = ?", (seq,)).fetchone()
+        n = (row[0] if row else 0) + 1
+        self.conn.execute("INSERT INTO sequences VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET last = excluded.last", (seq, n))
+        return f"{PREFIX[seq]}-{n:05d}"
+
+    def _rows(self, sql, *args):
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def _row(self, sql, *args):
+        r = self.conn.execute(sql, args).fetchone()
+        return dict(r) if r else None
+
+    # ---- settings
+    def setting(self, key: str) -> str:
+        r = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return r[0] if r else DEFAULT_SETTINGS.get(key, "")
+
+    def set_setting(self, key: str, value: str) -> None:
+        if key not in DEFAULT_SETTINGS:
+            raise ERPError(f"Unknown setting {key}.")
+        value = str(value).strip()
+        if key == "company_name" and not value:
+            raise ERPError("Enter a company name.")
+        if key == "tax_percent":
+            try:
+                d = Decimal(value or "0")
+            except InvalidOperation:
+                raise ERPError("Enter the tax rate as a percentage.") from None
+            if not d.is_finite() or d < 0 or d > 100:
+                raise ERPError("Enter a tax rate between 0 and 100.")
+            value = str(d)
+        with self.tx():
+            self.conn.execute("INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+            self._log("settings", f"{key} = {value}")
+
+    def money(self, cents: int) -> str:
+        return fmt_money(cents, self.setting("currency") or "$")
+
+    # ---- contacts
+    def add_contact(self, kind, name, contact="", email="", phone="", address="", terms_days=30, notes="") -> int:
+        name = _clean(name)
+        if not name:
+            raise ERPError("Enter a name.")
+        if kind not in ("customer", "supplier"):
+            raise ERPError("A contact is a customer or a supplier.")
+        with self.tx():
+            cur = self.conn.execute("INSERT INTO contacts (kind, name, contact, email, phone, address, terms_days, notes) "
+                                    "VALUES (?,?,?,?,?,?,?,?)", (kind, name, _clean(contact), _clean(email), _clean(phone),
+                                                                 str(address or "").strip(), int(terms_days), str(notes or "").strip()))
+            self._log("contact.add", name)
+            return cur.lastrowid
+
+    def update_contact(self, cid, **f) -> None:
+        allowed = {"name", "contact", "email", "phone", "address", "terms_days", "notes", "active"}
+        if set(f) - allowed:
+            raise ERPError("Unknown contact field.")
+        if "name" in f and not _clean(f["name"]):
+            raise ERPError("Enter a name.")
+        with self.tx():
+            for k, v in f.items():
+                self.conn.execute(f"UPDATE contacts SET {k} = ? WHERE id = ?", (v, cid))  # noqa: S608 - k is from `allowed`
+            self._log("contact.update", str(cid))
+
+    def contacts(self, kind, search="", include_inactive=False):
+        q = f"%{search.strip()}%"
+        return self._rows("SELECT * FROM contacts WHERE kind = ? AND (name LIKE ? OR contact LIKE ? OR email LIKE ?) "
+                          "AND (active = 1 OR ?) ORDER BY name COLLATE NOCASE", kind, q, q, q, 1 if include_inactive else 0)
+
+    def contact(self, cid):
+        return self._row("SELECT * FROM contacts WHERE id = ?", cid)
+
+    # ---- items
+    def add_item(self, number, description="", kind="buy", unit="EA", cost=0, price=0, reorder_point=0, reorder_qty=0,
+                 supplier_id=None, lead_days=0, bin="", notes="", rw_document="", rw_number="") -> int:  # noqa: A002
+        number = _clean(number)
+        if not number:
+            raise ERPError("Enter an item number.")
+        if kind not in KINDS:
+            raise ERPError("An item is bought or made.")
+        if min(cost, price, reorder_point, reorder_qty, lead_days) < 0:
+            raise ERPError("Costs, prices and reorder values can't be negative.")
+        try:
+            with self.tx():
+                cur = self.conn.execute(
+                    "INSERT INTO items (number, description, kind, unit, cost, price, reorder_point, reorder_qty, supplier_id, "
+                    "lead_days, bin, notes, rw_document, rw_number) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (number, _clean(description), kind, _clean(unit) or "EA", cost, price, reorder_point, reorder_qty, supplier_id,
+                     lead_days, _clean(bin), str(notes or "").strip(), rw_document, rw_number))
+                self._log("item.add", number)
+                return cur.lastrowid
+        except sqlite3.IntegrityError:
+            raise ERPError(f"There is already an item {number}.") from None
+
+    ITEM_FIELDS = {"number", "description", "kind", "unit", "cost", "price", "reorder_point", "reorder_qty", "supplier_id",
+                   "lead_days", "bin", "notes", "active", "rw_document", "rw_number"}
+
+    def update_item(self, item_id, **f) -> None:
+        if set(f) - self.ITEM_FIELDS:
+            raise ERPError("Unknown item field.")
+        if "number" in f and not _clean(f["number"]):
+            raise ERPError("Enter an item number.")
+        try:
+            with self.tx():
+                for k, v in f.items():
+                    self.conn.execute(f"UPDATE items SET {k} = ? WHERE id = ?", (v, item_id))  # noqa: S608 - k is from ITEM_FIELDS
+                self._log("item.update", str(item_id))
+        except sqlite3.IntegrityError as e:
+            raise ERPError(f"That item number is already used, or a value isn't allowed.\n\n{e}") from None
+
+    _ITEM_SELECT = """
+        SELECT i.*, c.name AS supplier,
+          COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.item_id = i.id), 0) AS on_hand,
+          COALESCE((SELECT SUM(l.qty - l.received) FROM purchase_lines l JOIN purchase_orders o ON o.id = l.order_id
+                    WHERE l.item_id = i.id AND o.status = 'ordered' AND l.qty > l.received), 0)
+          + COALESCE((SELECT SUM(w.qty - w.done) FROM work_orders w WHERE w.item_id = i.id AND w.status = 'released'), 0) AS on_order,
+          COALESCE((SELECT SUM(l.qty - l.shipped) FROM sales_lines l JOIN sales_orders o ON o.id = l.order_id
+                    WHERE l.item_id = i.id AND o.status = 'confirmed' AND l.qty > l.shipped), 0)
+          + COALESCE((SELECT SUM((w.qty - w.done) * b.qty / 1000) FROM work_orders w JOIN bom_lines b ON b.parent_id = w.item_id
+                      WHERE b.child_id = i.id AND w.status = 'released'), 0) AS allocated
+        FROM items i LEFT JOIN contacts c ON c.id = i.supplier_id"""
+
+    def items(self, search="", include_inactive=False):
+        q = f"%{search.strip()}%"
+        return self._rows(self._ITEM_SELECT + " WHERE (i.number LIKE ? OR i.description LIKE ?) AND (i.active = 1 OR ?) "
+                          "ORDER BY i.number COLLATE NOCASE", q, q, 1 if include_inactive else 0)
+
+    def item(self, item_id):
+        return self._row(self._ITEM_SELECT + " WHERE i.id = ?", item_id)
+
+    def item_by_number(self, number):
+        return self._row(self._ITEM_SELECT + " WHERE i.number = ? COLLATE NOCASE", _clean(number))
+
+    def on_hand(self, item_id) -> int:
+        return self.conn.execute("SELECT COALESCE(SUM(qty), 0) FROM stock_moves WHERE item_id = ?", (item_id,)).fetchone()[0]
+
+    # ---- bill of materials
+    def bom(self, item_id):
+        return self._rows("SELECT b.*, i.number, i.description, i.unit, i.cost, i.kind FROM bom_lines b JOIN items i ON i.id = b.child_id "
+                          "WHERE b.parent_id = ? ORDER BY CAST(b.find_number AS INTEGER), b.find_number, i.number", item_id)
+
+    def where_used(self, item_id):
+        return self._rows("SELECT b.qty, i.id, i.number, i.description FROM bom_lines b JOIN items i ON i.id = b.parent_id "
+                          "WHERE b.child_id = ? ORDER BY i.number", item_id)
+
+    def _would_cycle(self, parent_id, child_id) -> bool:
+        seen, stack = set(), [child_id]
+        while stack:
+            cur = stack.pop()
+            if cur == parent_id:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack += [r[0] for r in self.conn.execute("SELECT child_id FROM bom_lines WHERE parent_id = ?", (cur,))]
+        return False
+
+    def set_bom_line(self, parent_id, child_id, qty, find_number="") -> None:
+        if qty <= 0:
+            raise ERPError("A BOM quantity must be more than zero.")
+        if self._would_cycle(parent_id, child_id):
+            raise ERPError("That would make an item a part of itself.")
+        with self.tx():
+            self.conn.execute("INSERT INTO bom_lines (parent_id, child_id, qty, find_number) VALUES (?,?,?,?) "
+                              "ON CONFLICT(parent_id, child_id) DO UPDATE SET qty = excluded.qty, find_number = excluded.find_number",
+                              (parent_id, child_id, qty, str(find_number or "")))
+            self.conn.execute("UPDATE items SET kind = 'make' WHERE id = ?", (parent_id,))
+            self._log("bom.set", f"{parent_id} <- {child_id} x {fmt_qty(qty)}")
+
+    def remove_bom_line(self, line_id) -> None:
+        with self.tx():
+            self.conn.execute("DELETE FROM bom_lines WHERE id = ?", (line_id,))
+            self._log("bom.remove", str(line_id))
+
+    def rollup_cost(self, item_id, _seen=None) -> int:
+        """Cost to build one: components' costs, using each made component's own build-up where it has a BOM."""
+        _seen = _seen or set()
+        total = 0
+        for line in self.bom(item_id):
+            if line["child_id"] in _seen:
+                continue
+            sub = self.bom(line["child_id"])
+            unit = self.rollup_cost(line["child_id"], _seen | {item_id}) if sub else line["cost"]
+            total += line_total(line["qty"], unit)
+        return total
+
+    # ---- stock
+    def _move(self, item_id, qty, kind, ref="", note="", unit_cost=0) -> None:
+        self.conn.execute("INSERT INTO stock_moves (time, item_id, qty, unit_cost, kind, ref, note, user) VALUES (?,?,?,?,?,?,?,?)",
+                          (_now(), item_id, qty, unit_cost, kind, ref, note, self.user))
+
+    def _add_at_cost(self, item, qty, unit_cost, kind, ref, note="") -> None:
+        """Bring stock in at a cost, keeping a moving average so the stock value stays true."""
+        have = self.on_hand(item["id"])
+        if have > 0 and item["cost"] > 0:
+            avg = (have * item["cost"] + qty * unit_cost + (have + qty) // 2) // (have + qty)
+        else:
+            avg = unit_cost
+        self.conn.execute("UPDATE items SET cost = ? WHERE id = ?", (avg, item["id"]))
+        self._move(item["id"], qty, kind, ref, note, unit_cost)
+
+    def adjust_stock(self, item_id, delta, note, unit_cost=None) -> None:
+        if not _clean(note):
+            raise ERPError("Say why the stock is being adjusted; the reason goes in the ledger.")
+        if delta == 0:
+            raise ERPError("Enter a quantity other than zero.")
+        with self.tx():
+            item = self.item(item_id)
+            if item["on_hand"] + delta < 0:
+                raise ERPError(f"{item['number']} has {fmt_qty(item['on_hand'])} on hand, so it can't go down by {fmt_qty(-delta)}.")
+            if delta > 0:
+                self._add_at_cost(item, delta, item["cost"] if unit_cost is None else unit_cost, "adjust", "", _clean(note))
+            else:
+                self._move(item_id, delta, "adjust", "", _clean(note), item["cost"])
+            self._log("stock.adjust", f"{item['number']} {fmt_qty(delta)}: {note}")
+
+    def moves(self, item_id=None, limit=500):
+        where, args = ("WHERE m.item_id = ?", [item_id]) if item_id else ("", [])
+        return self._rows(f"SELECT m.*, i.number, i.description FROM stock_moves m JOIN items i ON i.id = m.item_id {where} "  # noqa: S608
+                          "ORDER BY m.id DESC LIMIT ?", *args, limit)
+
+    def stock_value(self) -> int:
+        total = 0
+        for r in self.conn.execute("SELECT i.cost, COALESCE(SUM(m.qty), 0) FROM items i LEFT JOIN stock_moves m ON m.item_id = i.id GROUP BY i.id"):
+            total += line_total(r[1], r[0])
+        return total
+
+    # ---- sales orders
+    def create_sales_order(self, customer_id, due_date="", reference="", notes="") -> int:
+        if not self.contact(customer_id):
+            raise ERPError("Choose a customer.")
+        with self.tx():
+            number = self._next("so")
+            cur = self.conn.execute("INSERT INTO sales_orders (number, customer_id, status, order_date, due_date, reference, notes) "
+                                    "VALUES (?,?,'draft',?,?,?,?)", (number, customer_id, today(), _date(due_date, "due date"), _clean(reference), str(notes or "")))
+            self._log("so.create", number)
+            return cur.lastrowid
+
+    def sales_orders(self, status=None, search=""):
+        q = f"%{search.strip()}%"
+        cond = "AND o.status = ?" if status else ""
+        args = [q, q, q] + ([status] if status else [])
+        return self._rows(f"""SELECT o.*, c.name AS customer, COALESCE(SUM(l.qty * l.unit_price / {QTY_SCALE}), 0) AS total,
+            COUNT(l.id) AS line_count, COALESCE(SUM(l.qty - l.shipped), 0) AS to_ship,
+            COALESCE(SUM(l.shipped - l.invoiced), 0) AS to_invoice
+            FROM sales_orders o JOIN contacts c ON c.id = o.customer_id LEFT JOIN sales_lines l ON l.order_id = o.id
+            WHERE (o.number LIKE ? OR c.name LIKE ? OR o.reference LIKE ?) {cond} GROUP BY o.id ORDER BY o.id DESC""", *args)  # noqa: S608
+
+    def sales_order(self, oid):
+        return self._row("""SELECT o.*, c.name AS customer, c.terms_days FROM sales_orders o JOIN contacts c ON c.id = o.customer_id WHERE o.id = ?""", oid)
+
+    def sales_lines(self, oid):
+        return self._rows("SELECT l.*, i.number, i.description, i.unit FROM sales_lines l JOIN items i ON i.id = l.item_id WHERE l.order_id = ? ORDER BY l.id", oid)
+
+    def _so(self, oid, *allowed):
+        o = self.sales_order(oid)
+        if o is None:
+            raise ERPError("That order no longer exists.")
+        if allowed and o["status"] not in allowed:
+            raise ERPError(f"{o['number']} is {o['status']}, so that can't be done.")
+        return o
+
+    def add_sales_line(self, oid, item_id, qty, unit_price=None) -> int:
+        if qty <= 0:
+            raise ERPError("Enter a quantity above zero.")
+        with self.tx():
+            self._so(oid, "draft")
+            item = self.item(item_id)
+            if item is None:
+                raise ERPError("Choose an item.")
+            price = item["price"] if unit_price is None else unit_price
+            if price < 0:
+                raise ERPError("A price can't be negative.")
+            cur = self.conn.execute("INSERT INTO sales_lines (order_id, item_id, qty, unit_price) VALUES (?,?,?,?)", (oid, item_id, qty, price))
+            return cur.lastrowid
+
+    def remove_sales_line(self, line_id) -> None:
+        with self.tx():
+            r = self._row("SELECT order_id FROM sales_lines WHERE id = ?", line_id)
+            if r:
+                self._so(r["order_id"], "draft")
+                self.conn.execute("DELETE FROM sales_lines WHERE id = ?", (line_id,))
+
+    def confirm_sales_order(self, oid) -> None:
+        with self.tx():
+            o = self._so(oid, "draft")
+            if not self.sales_lines(oid):
+                raise ERPError("Add at least one line first.")
+            self.conn.execute("UPDATE sales_orders SET status = 'confirmed' WHERE id = ?", (oid,))
+            self._log("so.confirm", o["number"])
+
+    def ship_sales_order(self, oid, quantities: dict | None = None) -> None:
+        """Ship {line id: qty}, or everything still to ship. Stock can't go negative: it would be a false record."""
+        with self.tx():
+            o = self._so(oid, "confirmed")
+            lines = self.sales_lines(oid)
+            todo = {l["id"]: l["qty"] - l["shipped"] for l in lines} if quantities is None else quantities
+            any_shipped = False
+            by_id = {l["id"]: l for l in lines}
+            for line_id, q in todo.items():
+                if q == 0:
+                    continue
+                line = by_id.get(line_id)
+                if line is None:
+                    raise ERPError("That line isn't on this order.")
+                if q < 0 or q > line["qty"] - line["shipped"]:
+                    raise ERPError(f"{line['number']}: can't ship {fmt_qty(q)}; {fmt_qty(line['qty'] - line['shipped'])} is left to ship.")
+                have = self.on_hand(line["item_id"])
+                if q > have:
+                    raise ERPError(f"{line['number']}: {fmt_qty(have)} on hand, not enough to ship {fmt_qty(q)}. Nothing was shipped.")
+                item = self.item(line["item_id"])
+                self._move(line["item_id"], -q, "shipment", o["number"], unit_cost=item["cost"])
+                self.conn.execute("UPDATE sales_lines SET shipped = shipped + ? WHERE id = ?", (q, line_id))
+                any_shipped = True
+            if not any_shipped:
+                raise ERPError("Nothing to ship.")
+            left = self.conn.execute("SELECT COALESCE(SUM(qty - shipped), 0) FROM sales_lines WHERE order_id = ?", (oid,)).fetchone()[0]
+            if left == 0:
+                self.conn.execute("UPDATE sales_orders SET status = 'shipped' WHERE id = ?", (oid,))
+            self._log("so.ship", o["number"])
+
+    def cancel_sales_order(self, oid) -> None:
+        with self.tx():
+            o = self._so(oid, "draft", "confirmed")
+            if any(l["shipped"] for l in self.sales_lines(oid)):
+                raise ERPError(f"{o['number']} has shipped lines, so it can't be cancelled.")
+            self.conn.execute("UPDATE sales_orders SET status = 'cancelled' WHERE id = ?", (oid,))
+            self._log("so.cancel", o["number"])
+
+    # ---- invoices
+    def invoice_sales_order(self, oid) -> int:
+        """Invoice whatever has shipped and hasn't been invoiced yet."""
+        with self.tx():
+            o = self._so(oid, "confirmed", "shipped")
+            lines = [l for l in self.sales_lines(oid) if l["shipped"] > l["invoiced"]]
+            if not lines:
+                raise ERPError(f"{o['number']} has nothing shipped that isn't already invoiced.")
+            number = self._next("inv")
+            subtotal = sum(line_total(l["shipped"] - l["invoiced"], l["unit_price"]) for l in lines)
+            pct = Decimal(self.setting("tax_percent") or "0")
+            tax = int((Decimal(subtotal) * pct / 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+            issued = date.today()
+            due = issued + timedelta(days=o["terms_days"])
+            cur = self.conn.execute("INSERT INTO invoices (number, order_id, customer_id, status, issued, due, subtotal, tax, tax_percent) "
+                                    "VALUES (?,?,?,'open',?,?,?,?,?)", (number, oid, o["customer_id"], issued.isoformat(), due.isoformat(), subtotal, tax, str(pct)))
+            inv = cur.lastrowid
+            for l in lines:
+                q = l["shipped"] - l["invoiced"]
+                self.conn.execute("INSERT INTO invoice_lines (invoice_id, sales_line_id, item_id, qty, unit_price) VALUES (?,?,?,?,?)", (inv, l["id"], l["item_id"], q, l["unit_price"]))
+                self.conn.execute("UPDATE sales_lines SET invoiced = invoiced + ? WHERE id = ?", (q, l["id"]))
+            self._log("invoice.create", f"{number} for {o['number']}")
+            return inv
+
+    def invoices(self, status=None, search=""):
+        q = f"%{search.strip()}%"
+        cond = "AND v.status = ?" if status else ""
+        args = [q, q] + ([status] if status else [])
+        return self._rows(f"""SELECT v.*, c.name AS customer, o.number AS order_number, v.subtotal + v.tax AS total FROM invoices v
+            JOIN contacts c ON c.id = v.customer_id JOIN sales_orders o ON o.id = v.order_id
+            WHERE (v.number LIKE ? OR c.name LIKE ?) {cond} ORDER BY v.id DESC""", *args)  # noqa: S608
+
+    def invoice(self, inv):
+        return self._row("""SELECT v.*, c.name AS customer, c.address AS customer_address, o.number AS order_number, o.reference, v.subtotal + v.tax AS total FROM invoices v
+            JOIN contacts c ON c.id = v.customer_id JOIN sales_orders o ON o.id = v.order_id WHERE v.id = ?""", inv)
+
+    def invoice_lines(self, inv):
+        return self._rows("SELECT l.*, i.number, i.description, i.unit FROM invoice_lines l JOIN items i ON i.id = l.item_id WHERE l.invoice_id = ? ORDER BY l.id", inv)
+
+    def mark_invoice_paid(self, inv, paid_on=None) -> None:
+        with self.tx():
+            v = self.invoice(inv)
+            if v is None or v["status"] != "open":
+                raise ERPError("Only an open invoice can be marked paid.")
+            self.conn.execute("UPDATE invoices SET status = 'paid', paid_on = ? WHERE id = ?", (_date(paid_on, "payment date") or today(), inv))
+            self._log("invoice.paid", v["number"])
+
+    def void_invoice(self, inv) -> None:
+        """Void it and put its quantities back to be invoiced again. The number stays used."""
+        with self.tx():
+            v = self.invoice(inv)
+            if v is None or v["status"] != "open":
+                raise ERPError("Only an open invoice can be voided.")
+            for l in self.invoice_lines(inv):
+                self.conn.execute("UPDATE sales_lines SET invoiced = invoiced - ? WHERE id = ?", (l["qty"], l["sales_line_id"]))
+            self.conn.execute("UPDATE invoices SET status = 'void' WHERE id = ?", (inv,))
+            self._log("invoice.void", v["number"])
+
+    # ---- purchase orders
+    def create_purchase_order(self, supplier_id, due_date="", reference="", notes="") -> int:
+        if not self.contact(supplier_id):
+            raise ERPError("Choose a supplier.")
+        with self.tx():
+            number = self._next("po")
+            cur = self.conn.execute("INSERT INTO purchase_orders (number, supplier_id, status, order_date, due_date, reference, notes) "
+                                    "VALUES (?,?,'draft',?,?,?,?)", (number, supplier_id, today(), _date(due_date, "due date"), _clean(reference), str(notes or "")))
+            self._log("po.create", number)
+            return cur.lastrowid
+
+    def purchase_orders(self, status=None, search=""):
+        q = f"%{search.strip()}%"
+        cond = "AND o.status = ?" if status else ""
+        args = [q, q, q] + ([status] if status else [])
+        return self._rows(f"""SELECT o.*, c.name AS supplier, COALESCE(SUM(l.qty * l.unit_cost / {QTY_SCALE}), 0) AS total,
+            COUNT(l.id) AS line_count, COALESCE(SUM(l.qty - l.received), 0) AS to_receive
+            FROM purchase_orders o JOIN contacts c ON c.id = o.supplier_id LEFT JOIN purchase_lines l ON l.order_id = o.id
+            WHERE (o.number LIKE ? OR c.name LIKE ? OR o.reference LIKE ?) {cond} GROUP BY o.id ORDER BY o.id DESC""", *args)  # noqa: S608
+
+    def purchase_order(self, oid):
+        return self._row("SELECT o.*, c.name AS supplier, c.address AS supplier_address FROM purchase_orders o JOIN contacts c ON c.id = o.supplier_id WHERE o.id = ?", oid)
+
+    def purchase_lines(self, oid):
+        return self._rows("SELECT l.*, i.number, i.description, i.unit FROM purchase_lines l JOIN items i ON i.id = l.item_id WHERE l.order_id = ? ORDER BY l.id", oid)
+
+    def _po(self, oid, *allowed):
+        o = self.purchase_order(oid)
+        if o is None:
+            raise ERPError("That order no longer exists.")
+        if allowed and o["status"] not in allowed:
+            raise ERPError(f"{o['number']} is {o['status']}, so that can't be done.")
+        return o
+
+    def add_purchase_line(self, oid, item_id, qty, unit_cost=None) -> int:
+        if qty <= 0:
+            raise ERPError("Enter a quantity above zero.")
+        with self.tx():
+            self._po(oid, "draft")
+            item = self.item(item_id)
+            if item is None:
+                raise ERPError("Choose an item.")
+            cost = item["cost"] if unit_cost is None else unit_cost
+            if cost < 0:
+                raise ERPError("A cost can't be negative.")
+            cur = self.conn.execute("INSERT INTO purchase_lines (order_id, item_id, qty, unit_cost) VALUES (?,?,?,?)", (oid, item_id, qty, cost))
+            return cur.lastrowid
+
+    def remove_purchase_line(self, line_id) -> None:
+        with self.tx():
+            r = self._row("SELECT order_id FROM purchase_lines WHERE id = ?", line_id)
+            if r:
+                self._po(r["order_id"], "draft")
+                self.conn.execute("DELETE FROM purchase_lines WHERE id = ?", (line_id,))
+
+    def place_purchase_order(self, oid) -> None:
+        with self.tx():
+            o = self._po(oid, "draft")
+            if not self.purchase_lines(oid):
+                raise ERPError("Add at least one line first.")
+            self.conn.execute("UPDATE purchase_orders SET status = 'ordered' WHERE id = ?", (oid,))
+            self._log("po.place", o["number"])
+
+    def receive_purchase_order(self, oid, quantities: dict | None = None) -> None:
+        with self.tx():
+            o = self._po(oid, "ordered")
+            lines = self.purchase_lines(oid)
+            by_id = {l["id"]: l for l in lines}
+            todo = {l["id"]: l["qty"] - l["received"] for l in lines} if quantities is None else quantities
+            any_received = False
+            for line_id, q in todo.items():
+                if q == 0:
+                    continue
+                line = by_id.get(line_id)
+                if line is None:
+                    raise ERPError("That line isn't on this order.")
+                if q < 0 or q > line["qty"] - line["received"]:
+                    raise ERPError(f"{line['number']}: can't receive {fmt_qty(q)}; {fmt_qty(line['qty'] - line['received'])} is outstanding.")
+                self._add_at_cost(self.item(line["item_id"]), q, line["unit_cost"], "receipt", o["number"])
+                self.conn.execute("UPDATE purchase_lines SET received = received + ? WHERE id = ?", (q, line_id))
+                any_received = True
+            if not any_received:
+                raise ERPError("Nothing to receive.")
+            left = self.conn.execute("SELECT COALESCE(SUM(qty - received), 0) FROM purchase_lines WHERE order_id = ?", (oid,)).fetchone()[0]
+            if left == 0:
+                self.conn.execute("UPDATE purchase_orders SET status = 'received' WHERE id = ?", (oid,))
+            self._log("po.receive", o["number"])
+
+    def cancel_purchase_order(self, oid) -> None:
+        with self.tx():
+            o = self._po(oid, "draft", "ordered")
+            if any(l["received"] for l in self.purchase_lines(oid)):
+                raise ERPError(f"{o['number']} has received lines, so it can't be cancelled.")
+            self.conn.execute("UPDATE purchase_orders SET status = 'cancelled' WHERE id = ?", (oid,))
+            self._log("po.cancel", o["number"])
+
+    # ---- work orders
+    def create_work_order(self, item_id, qty, due_date="", notes="") -> int:
+        if qty <= 0:
+            raise ERPError("Enter a quantity above zero.")
+        item = self.item(item_id)
+        if item is None:
+            raise ERPError("Choose an item.")
+        with self.tx():
+            number = self._next("wo")
+            cur = self.conn.execute("INSERT INTO work_orders (number, item_id, qty, status, created, due_date, notes) VALUES (?,?,?,'draft',?,?,?)",
+                                    (number, item_id, qty, today(), _date(due_date, "due date"), str(notes or "")))
+            self._log("wo.create", number)
+            return cur.lastrowid
+
+    _WO_SELECT = "SELECT w.*, i.number AS item_number, i.description, i.unit, i.rw_document, i.rw_number FROM work_orders w JOIN items i ON i.id = w.item_id"
+
+    def work_orders(self, status=None, search=""):
+        q = f"%{search.strip()}%"
+        cond = "AND w.status = ?" if status else ""
+        args = [q, q] + ([status] if status else [])
+        return self._rows(f"{self._WO_SELECT} WHERE (w.number LIKE ? OR i.number LIKE ?) {cond} ORDER BY w.id DESC", *args)  # noqa: S608
+
+    def work_order(self, wid):
+        return self._row(f"{self._WO_SELECT} WHERE w.id = ?", wid)  # noqa: S608
+
+    def work_order_components(self, wid):
+        w = self.work_order(wid)
+        out = []
+        for b in self.bom(w["item_id"]):
+            each = b["qty"]
+            need = (w["qty"] - w["done"]) * each // QTY_SCALE
+            out.append({**b, "needed": need, "on_hand": self.on_hand(b["child_id"])})
+        return out
+
+    def release_work_order(self, wid, rw_document="", rw_revision="", rw_label="", rw_note="") -> None:
+        """Release to the shop floor, recording which controlled revision is being built, if there is one."""
+        with self.tx():
+            w = self.work_order(wid)
+            if w is None or w["status"] != "draft":
+                raise ERPError("Only a draft work order can be released.")
+            if not self.bom(w["item_id"]):
+                raise ERPError(f"{w['item_number']} has no bill of materials, so nothing would be consumed. Add one first.")
+            self.conn.execute("UPDATE work_orders SET status = 'released', build_rw_document = ?, build_rw_revision = ?, build_rw_label = ?, build_rw_note = ? WHERE id = ?",
+                              (rw_document, rw_revision, rw_label, rw_note, wid))
+            self._log("wo.release", f"{w['number']}" + (f" to Rev {rw_label}" if rw_label else ""))
+
+    def complete_work_order(self, wid, qty=None) -> None:
+        """Consume components from stock and bring finished goods in at their actual cost."""
+        with self.tx():
+            w = self.work_order(wid)
+            if w is None or w["status"] != "released":
+                raise ERPError("Only a released work order can be completed.")
+            left = w["qty"] - w["done"]
+            q = left if qty is None else qty
+            if q <= 0 or q > left:
+                raise ERPError(f"{fmt_qty(left)} is left to make on {w['number']}.")
+            cost = 0
+            for b in self.bom(w["item_id"]):
+                use = (q * b["qty"] + QTY_SCALE - 1) // QTY_SCALE
+                have = self.on_hand(b["child_id"])
+                if use > have:
+                    raise ERPError(f"{b['number']}: {fmt_qty(have)} on hand, {fmt_qty(use)} needed. Nothing was consumed.")
+                self._move(b["child_id"], -use, "consume", w["number"], unit_cost=b["cost"])
+                cost += line_total(use, b["cost"])
+            unit = (cost * QTY_SCALE + q // 2) // q
+            self._add_at_cost(self.item(w["item_id"]), q, unit, "produce", w["number"])
+            done = w["done"] + q
+            status = "complete" if done >= w["qty"] else "released"
+            self.conn.execute("UPDATE work_orders SET done = ?, status = ? WHERE id = ?", (done, status, wid))
+            self._log("wo.complete", f"{w['number']}, {fmt_qty(q)} made")
+
+    def cancel_work_order(self, wid) -> None:
+        with self.tx():
+            w = self.work_order(wid)
+            if w is None or w["status"] not in ("draft", "released"):
+                raise ERPError("Only a draft or released work order can be cancelled.")
+            if w["done"]:
+                raise ERPError(f"{w['number']} has finished quantities, so it can't be cancelled.")
+            self.conn.execute("UPDATE work_orders SET status = 'cancelled' WHERE id = ?", (wid,))
+            self._log("wo.cancel", w["number"])
+
+    # ---- from RevisionWorx
+    def import_bom(self, root_number: str, parts: list, lines: list, source: dict) -> dict:
+        """Replace item BOMs from a validated RevisionWorx structure, atomically.
+
+        parts: [{"number", "description", "unit"}]; lines: [{"parent", "child", "qty" (int), "find"}]. Items that
+        don't exist yet are created. Stock, costs and prices of existing items are left alone."""
+        with self.tx():
+            created, replaced = [], []
+            parents = {l["parent"].casefold() for l in lines}
+            ids = {}
+            for p in parts:
+                number = _clean(p["number"])
+                if not number:
+                    raise ERPError("The BOM has a part with no number.")
+                found = self.item_by_number(number)
+                if found is None:
+                    item_id = self.add_item(number, p.get("description", ""), "make" if number.casefold() in parents else "buy", p.get("unit") or "EA")
+                    created.append(number)
+                else:
+                    item_id = found["id"]
+                ids[number.casefold()] = item_id
+            for parent in sorted(parents):
+                if parent not in ids:
+                    raise ERPError(f"The BOM names a parent {parent} it doesn't list.")
+                self.conn.execute("DELETE FROM bom_lines WHERE parent_id = ?", (ids[parent],))
+                self.conn.execute("UPDATE items SET kind = 'make' WHERE id = ?", (ids[parent],))
+                replaced.append(parent)
+            for l in lines:
+                parent, child = ids.get(l["parent"].casefold()), ids.get(l["child"].casefold())
+                if parent is None or child is None:
+                    raise ERPError(f"A BOM line refers to {l['child']}, which isn't in the BOM.")
+                self.set_bom_line(parent, child, l["qty"], l.get("find", ""))
+            root = ids.get(root_number.casefold())
+            if root is None:
+                raise ERPError(f"The BOM's top item {root_number} isn't in it.")
+            self.conn.execute("UPDATE items SET bom_rw_document = ?, bom_rw_revision = ?, bom_rw_label = ?, bom_rw_sha256 = ? WHERE id = ?",
+                              (source.get("document", ""), source.get("revision", ""), source.get("label", ""), source.get("sha256", ""), root))
+            self._log("bom.import", f"{root_number} from {source.get('number', '')} Rev {source.get('label', '')}")
+            return {"root": root, "created": created, "replaced": replaced, "lines": len(lines)}
+
+    # ---- overview
+    def attention(self):
+        """What needs someone's attention, most urgent first: (severity, text, page, record id)."""
+        out = []
+        t = today()
+        for v in self._rows("SELECT v.id, v.number, v.due, c.name, v.subtotal + v.tax AS total FROM invoices v JOIN contacts c ON c.id = v.customer_id WHERE v.status = 'open' AND v.due < ? ORDER BY v.due", t):
+            out.append(("danger", f"{v['number']} from {v['name']} is overdue: {self.money(v['total'])}, due {v['due']}", "invoices", v["id"]))
+        for o in self._rows("SELECT o.id, o.number, o.due_date, c.name FROM sales_orders o JOIN contacts c ON c.id = o.customer_id WHERE o.status = 'confirmed' AND o.due_date <> '' AND o.due_date < ? ORDER BY o.due_date", t):
+            out.append(("danger", f"{o['number']} for {o['name']} was due {o['due_date']}", "sales", o["id"]))
+        for o in self._rows("SELECT o.id, o.number, o.due_date, c.name FROM purchase_orders o JOIN contacts c ON c.id = o.supplier_id WHERE o.status = 'ordered' AND o.due_date <> '' AND o.due_date < ? ORDER BY o.due_date", t):
+            out.append(("warning", f"{o['number']} from {o['name']} was due {o['due_date']}", "purchasing", o["id"]))
+        for w in self._rows("SELECT w.id, w.number, w.due_date, i.number AS item FROM work_orders w JOIN items i ON i.id = w.item_id WHERE w.status = 'released' AND w.due_date <> '' AND w.due_date < ? ORDER BY w.due_date", t):
+            out.append(("warning", f"{w['number']} ({w['item']}) was due {w['due_date']}", "production", w["id"]))
+        for i in self.items():
+            if i["reorder_point"] and i["on_hand"] - i["allocated"] + i["on_order"] < i["reorder_point"]:
+                out.append(("warning", f"{i['number']} is below its reorder point: {fmt_qty(i['on_hand'])} on hand, {fmt_qty(i['allocated'])} allocated", "planning", i["id"]))
+        return out
+
+    def summary(self) -> dict:
+        one = lambda sql, *a: self.conn.execute(sql, a).fetchone()[0]  # noqa: E731
+        return {"stock_value": self.stock_value(),
+                "open_sales": one("SELECT COUNT(*) FROM sales_orders WHERE status = 'confirmed'"),
+                "open_sales_value": one(f"SELECT COALESCE(SUM((l.qty - l.shipped) * l.unit_price / {QTY_SCALE}), 0) FROM sales_lines l JOIN sales_orders o ON o.id = l.order_id WHERE o.status = 'confirmed'"),  # noqa: S608
+                "receivable": one("SELECT COALESCE(SUM(subtotal + tax), 0) FROM invoices WHERE status = 'open'"),
+                "open_invoices": one("SELECT COUNT(*) FROM invoices WHERE status = 'open'"),
+                "open_purchases": one("SELECT COUNT(*) FROM purchase_orders WHERE status = 'ordered'"),
+                "open_purchase_value": one(f"SELECT COALESCE(SUM((l.qty - l.received) * l.unit_cost / {QTY_SCALE}), 0) FROM purchase_lines l JOIN purchase_orders o ON o.id = l.order_id WHERE o.status = 'ordered'"),  # noqa: S608
+                "open_work": one("SELECT COUNT(*) FROM work_orders WHERE status = 'released'")}
+
+    def activity(self, limit=20):
+        return self._rows("SELECT * FROM audit ORDER BY id DESC LIMIT ?", limit)

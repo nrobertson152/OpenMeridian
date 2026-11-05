@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmeridian"
+dynamic = ["version"]
+description = "Free and open-source lightweight ERP for small engineering businesses, integrated with RevisionWorx"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Nate Robertson" }]
+requires-python = ">=3.10"
+dependencies = []          # core and command line: standard library only
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Manufacturing",
+    "Topic :: Office/Business",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.5"]   # LGPL-3.0, GPL-compatible, as in RevisionWorx
+dev = ["pytest", "pillow", "PySide6-Essentials>=6.5"]
+
+[project.urls]
+"Support development" = "https://ko-fi.com/nr270343"
+
+[project.gui-scripts]
+openmeridian = "openmeridian.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "openmeridian.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["openmeridian*"]
+
+[tool.setuptools.package-data]
+openmeridian = ["resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
