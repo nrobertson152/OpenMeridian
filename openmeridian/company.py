@@ -3,12 +3,16 @@ No GUI here: this module is what the window, the command line and the tests all 
 from __future__ import annotations
 
 import getpass
+import hashlib
+import secrets
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from . import db
+from .revisionworx import RevisionWorxError
 from .values import QTY_SCALE, fmt_money, fmt_qty, line_total
 
 
@@ -35,6 +39,15 @@ def _clean(text) -> str:
     return " ".join(str(text or "").split())
 
 
+def _serial_key(serial) -> str:
+    return unicodedata.normalize("NFC", str(serial)).casefold()
+
+
+def _short(text, limit) -> str:
+    text = _clean(text)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def _date(text, what="date") -> str:
     s = str(text or "").strip()
     if not s:
@@ -46,6 +59,11 @@ def _date(text, what="date") -> str:
 
 
 KINDS = ("buy", "make")
+TRACKING = ("none", "serial")          # "lot" is reserved in the file (format 2) for a later version
+REGISTER_DOMAIN = "openmeridian/register/v1"
+SERIAL_LIMIT, NAME_LIMIT = 100, 200    # RevisionWorx's limits for a unit's serial and name (its docs/UNITS.md)
+MISSING_NOTE = ("RevisionWorx recorded this completion but didn't list this unit yet: it finishes recording it when its "
+                "workspace is next opened for writing. Register again to pick it up.")
 DEFAULT_SETTINGS = {"company_name": "", "currency": "$", "tax_percent": "0", "address": "", "rw_workspace": ""}
 PREFIX = {"so": "SO", "po": "PO", "wo": "WO", "inv": "INV"}
 
@@ -66,6 +84,7 @@ class Company:
         with c.tx():
             for k, v in DEFAULT_SETTINGS.items():
                 c.conn.execute("INSERT INTO settings VALUES (?, ?)", (k, name if k == "company_name" else v))
+            c.conn.execute("INSERT INTO settings VALUES ('company_id', ?)", (secrets.token_hex(16),))
             c._log("company.create", name)
         return c
 
@@ -181,28 +200,38 @@ class Company:
 
     # ---- items
     def add_item(self, number, description="", kind="buy", unit="EA", cost=0, price=0, reorder_point=0, reorder_qty=0,
-                 supplier_id=None, lead_days=0, bin="", notes="", rw_document="", rw_number="") -> int:  # noqa: A002
+                 supplier_id=None, lead_days=0, bin="", notes="", rw_document="", rw_number="", tracking="none") -> int:  # noqa: A002
         number = _clean(number)
         if not number:
             raise ERPError("Enter an item number.")
         if kind not in KINDS:
             raise ERPError("An item is bought or made.")
+        self._check_tracking(kind, tracking)
         if min(cost, price, reorder_point, reorder_qty, lead_days) < 0:
             raise ERPError("Costs, prices and reorder values can't be negative.")
         try:
             with self.tx():
                 cur = self.conn.execute(
                     "INSERT INTO items (number, description, kind, unit, cost, price, reorder_point, reorder_qty, supplier_id, "
-                    "lead_days, bin, notes, rw_document, rw_number) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "lead_days, bin, notes, rw_document, rw_number, tracking) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (number, _clean(description), kind, _clean(unit) or "EA", cost, price, reorder_point, reorder_qty, supplier_id,
-                     lead_days, _clean(bin), str(notes or "").strip(), rw_document, rw_number))
+                     lead_days, _clean(bin), str(notes or "").strip(), rw_document, rw_number, tracking))
                 self._log("item.add", number)
                 return cur.lastrowid
         except sqlite3.IntegrityError:
             raise ERPError(f"There is already an item {number}.") from None
 
     ITEM_FIELDS = {"number", "description", "kind", "unit", "cost", "price", "reorder_point", "reorder_qty", "supplier_id",
-                   "lead_days", "bin", "notes", "active", "rw_document", "rw_number"}
+                   "lead_days", "bin", "notes", "active", "rw_document", "rw_number", "tracking"}
+
+    @staticmethod
+    def _check_tracking(kind, tracking) -> None:
+        if tracking == "lot":
+            raise ERPError("Tracking by lot isn't available in this version of OpenMeridian.")
+        if tracking not in TRACKING:
+            raise ERPError("An item is tracked by serial number, or not tracked.")
+        if tracking == "serial" and kind != "make":
+            raise ERPError("Serial numbers are given to items you make (a unit a work order builds).")
 
     def update_item(self, item_id, **f) -> None:
         if set(f) - self.ITEM_FIELDS:
@@ -211,6 +240,13 @@ class Company:
             raise ERPError("Enter an item number.")
         try:
             with self.tx():
+                now = self.item(item_id)
+                if now is not None and ("tracking" in f or "kind" in f):
+                    tracking, kind = f.get("tracking", now["tracking"]), f.get("kind", now["kind"])
+                    self._check_tracking(kind, tracking)
+                    if tracking != now["tracking"] and now["on_hand"] != 0:
+                        raise ERPError(f"{now['number']} has {fmt_qty(now['on_hand'])} on hand. Its stock has to be zero "
+                                       "before it starts or stops having serial numbers.")
                 for k, v in f.items():
                     self.conn.execute(f"UPDATE items SET {k} = ? WHERE id = ?", (v, item_id))  # noqa: S608 - k is from ITEM_FIELDS
                 self._log("item.update", str(item_id))
@@ -294,11 +330,11 @@ class Company:
         return total
 
     # ---- stock
-    def _move(self, item_id, qty, kind, ref="", note="", unit_cost=0) -> None:
-        self.conn.execute("INSERT INTO stock_moves (time, item_id, qty, unit_cost, kind, ref, note, user) VALUES (?,?,?,?,?,?,?,?)",
-                          (_now(), item_id, qty, unit_cost, kind, ref, note, self.user))
+    def _move(self, item_id, qty, kind, ref="", note="", unit_cost=0, serial="") -> None:
+        self.conn.execute("INSERT INTO stock_moves (time, item_id, qty, unit_cost, kind, ref, note, user, serial) "
+                          "VALUES (?,?,?,?,?,?,?,?,?)", (_now(), item_id, qty, unit_cost, kind, ref, note, self.user, serial))
 
-    def _add_at_cost(self, item, qty, unit_cost, kind, ref, note="") -> None:
+    def _add_at_cost(self, item, qty, unit_cost, kind, ref, note="", serial="") -> None:
         """Bring stock in at a cost, keeping a moving average so the stock value stays true."""
         have = self.on_hand(item["id"])
         if have > 0 and item["cost"] > 0:
@@ -306,7 +342,7 @@ class Company:
         else:
             avg = unit_cost
         self.conn.execute("UPDATE items SET cost = ? WHERE id = ?", (avg, item["id"]))
-        self._move(item["id"], qty, kind, ref, note, unit_cost)
+        self._move(item["id"], qty, kind, ref, note, unit_cost, serial)
 
     def adjust_stock(self, item_id, delta, note, unit_cost=None) -> None:
         if not _clean(note):
@@ -636,8 +672,10 @@ class Company:
                               (rw_document, rw_revision, rw_label, rw_note, wid))
             self._log("wo.release", f"{w['number']}" + (f" to Rev {rw_label}" if rw_label else ""))
 
-    def complete_work_order(self, wid, qty=None) -> None:
-        """Consume components from stock and bring finished goods in at their actual cost."""
+    def complete_work_order(self, wid, qty=None, serials=None) -> None:
+        """Consume components from stock and bring finished goods in at their actual cost. An item made with serial numbers
+        needs one serial per unit made (``serials``): each unit comes into stock under its serial and is listed on the work
+        order (``units_built``), ready to be registered in RevisionWorx."""
         with self.tx():
             w = self.work_order(wid)
             if w is None or w["status"] != "released":
@@ -646,6 +684,8 @@ class Company:
             q = left if qty is None else qty
             if q <= 0 or q > left:
                 raise ERPError(f"{fmt_qty(left)} is left to make on {w['number']}.")
+            item = self.item(w["item_id"])
+            serials = self._check_serials(item, q, serials)
             cost = 0
             for b in self.bom(w["item_id"]):
                 use = (q * b["qty"] + QTY_SCALE - 1) // QTY_SCALE
@@ -655,11 +695,119 @@ class Company:
                 self._move(b["child_id"], -use, "consume", w["number"], unit_cost=b["cost"])
                 cost += line_total(use, b["cost"])
             unit = (cost * QTY_SCALE + q // 2) // q
-            self._add_at_cost(self.item(w["item_id"]), q, unit, "produce", w["number"])
+            if serials:
+                batch = 1 + self.conn.execute("SELECT COALESCE(MAX(batch), 0) FROM wo_units WHERE work_order_id = ?",
+                                              (wid,)).fetchone()[0]
+                for sn in serials:
+                    self._add_at_cost(self.item(w["item_id"]), QTY_SCALE, unit, "produce", w["number"], serial=sn)
+                    self.conn.execute("INSERT INTO wo_units (work_order_id, item_id, serial, batch, made, model, name) "
+                                      "VALUES (?,?,?,?,?,?,?)", (wid, w["item_id"], sn, batch, today(), item["number"],
+                                                                 _short(item["description"], NAME_LIMIT)))
+            else:
+                self._add_at_cost(self.item(w["item_id"]), q, unit, "produce", w["number"])
             done = w["done"] + q
             status = "complete" if done >= w["qty"] else "released"
             self.conn.execute("UPDATE work_orders SET done = ?, status = ? WHERE id = ?", (done, status, wid))
-            self._log("wo.complete", f"{w['number']}, {fmt_qty(q)} made")
+            self._log("wo.complete", f"{w['number']}, {fmt_qty(q)} made" + (f": {', '.join(serials)}" if serials else ""))
+
+    def _check_serials(self, item, q, serials) -> list[str]:
+        """The serials for ``q`` units of ``item``: one each, none repeated, none already made. None for an item without."""
+        if item["tracking"] != "serial":
+            if serials:
+                raise ERPError(f"{item['number']} isn't made with serial numbers.")
+            return []
+        if q % QTY_SCALE:
+            raise ERPError(f"{item['number']} is made with serial numbers, so complete whole units.")
+        out = [unicodedata.normalize("NFC", _clean(sn)) for sn in (serials or []) if _clean(sn)]
+        if len(out) != q // QTY_SCALE:
+            raise ERPError(f"Give one serial number for each of the {fmt_qty(q)} {item['number']} made; {len(out)} given.")
+        seen = set()
+        for sn in out:
+            if sn.casefold() in seen:
+                raise ERPError(f"{sn} is given twice.")
+            seen.add(sn.casefold())
+            if len(sn) > SERIAL_LIMIT:
+                raise ERPError(f"{sn[:20]}… is longer than a serial number can be ({SERIAL_LIMIT} characters).")
+            if any(unicodedata.category(ch) == "Cc" for ch in sn):
+                raise ERPError(f"{sn!r} has a control character in it, which a serial number can't have.")
+            had = self._row("SELECT u.serial, u.model, w.number FROM wo_units u JOIN work_orders w ON w.id = u.work_order_id "
+                            "WHERE u.serial = ? COLLATE NOCASE", sn)
+            if had:
+                raise ERPError(f"Serial number {had['serial']} was already given, to the {had['model']} made on "
+                               f"{had['number']}. A serial number names one unit.")
+        return out
+
+    # ---- units built, and registering them in RevisionWorx (the one write to it; Director's decision, 2026-11-07)
+    def units_built(self, wid) -> list[dict]:
+        """The units a work order made, by serial, in the order made, with what RevisionWorx says of each."""
+        return self._rows("SELECT * FROM wo_units WHERE work_order_id = ? ORDER BY batch, id", wid)
+
+    def register_txid(self, wid, batch) -> str:
+        """The txid a completion's units are registered with: the same for every attempt, so RevisionWorx records them once
+        however often it is asked (its docs/INTEGRATION.md)."""
+        w = self.work_order(wid)
+        cid = self.setting("company_id")
+        if len(cid) != 32 or any(ch not in "0123456789abcdef" for ch in cid):
+            raise ERPError("This company file has no company id, so its units can't be registered in RevisionWorx: "
+                           "two companies' work orders of the same number would look alike there.")
+        key = f"{REGISTER_DOMAIN}\0{cid}\0{w['number']}\0{batch}"
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+    def register_units(self, wid, client) -> dict:
+        """Register in RevisionWorx the units this work order made that aren't registered yet, one completion at a time:
+        RevisionWorx records all of a completion's units or none. ``client`` is a revisionworx.Client.
+
+        Every attempt at a completion sends the same thing (its txid, all of its serials, and what they were built as,
+        kept when they were made), so RevisionWorx records it once however often it is asked, and an earlier attempt
+        whose answer was lost is simply answered again. Returns ``{"registered": [serials], "refused": [(serials,
+        why)]}``; what RevisionWorx refused stays listed on the work order with why, and nothing about it changed there."""
+        w = self.work_order(wid)
+        if w is None:
+            raise ERPError("No such work order.")
+        batches: dict[int, list[dict]] = {}
+        for u in self.units_built(wid):
+            batches.setdefault(u["batch"], []).append(u)
+        doc = f"{w['build_rw_document']}@{w['build_rw_revision']}" if w["build_rw_document"] and w["build_rw_revision"] else ""
+        out = {"registered": [], "refused": []}
+        for batch, units in sorted(batches.items()):
+            if all(u["rw_unit"] for u in units):
+                continue
+            serials = [u["serial"] for u in units]
+            try:
+                got = client.register_units(self.register_txid(wid, batch), serials, model=units[0]["model"],
+                                            name=units[0]["name"], built=units[0]["made"], document=doc,
+                                            evidence=f"work-order:{w['number']}")
+            except RevisionWorxError as e:
+                note = str(e) or "RevisionWorx refused."
+                if getattr(e, "kind", "") == "txid-used":
+                    note = (f"RevisionWorx already has different units registered from this completion of {w['number']} "
+                            "(from another copy of this company file, or an older backup of it, say). Nothing was changed "
+                            "there; check the units in RevisionWorx.")
+                pending = [u for u in units if not u["rw_unit"]]
+                with self.tx():
+                    for u in pending:
+                        self.conn.execute("UPDATE wo_units SET rw_note = ? WHERE id = ?", (note, u["id"]))
+                out["refused"].append(([u["serial"] for u in pending], note))
+                continue
+            ids = {_serial_key(sn): uid for sn, uid in got}
+            done, missing = [], []
+            with self.tx():
+                for u in units:
+                    if u["rw_unit"]:
+                        continue
+                    uid = ids.get(_serial_key(u["serial"]), "")
+                    if uid:
+                        self.conn.execute("UPDATE wo_units SET rw_unit = ?, rw_note = '' WHERE id = ?", (uid, u["id"]))
+                        done.append(u["serial"])
+                    else:
+                        missing.append(u["serial"])
+                        self.conn.execute("UPDATE wo_units SET rw_note = ? WHERE id = ?", (MISSING_NOTE, u["id"]))
+                if done:
+                    self._log("wo.register", f"{w['number']}: {', '.join(done)} in RevisionWorx")
+            out["registered"] += done
+            if missing:
+                out["refused"].append((missing, MISSING_NOTE))
+        return out
 
     def cancel_work_order(self, wid) -> None:
         with self.tx():

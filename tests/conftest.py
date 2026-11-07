@@ -78,3 +78,23 @@ def workspace(tmp_path, monkeypatch):
 def release(w, rev):
     for state in ("in_review", "approved", "released"):
         w.run("rev", "transition", rev, state)
+
+
+class FakeRevisionWorx:
+    """Answers as RevisionWorx's `link unit-register` does (all or none; the same txid and input answer the same units
+    again; the same txid with other input is refused), and keeps what it was asked."""
+    available = True
+
+    def __init__(self):
+        self.calls, self.done, self.refuse, self.unlisted = [], {}, None, set()
+
+    def register_units(self, txid, serials, **kw):
+        self.calls.append((txid, list(serials), kw))
+        if self.refuse:
+            raise rw.RevisionWorxError(*self.refuse)
+        request = (list(serials), kw)
+        if txid in self.done and self.done[txid][0] != request:
+            raise rw.RevisionWorxError(f"txid {txid} was used for something else", "txid-used")
+        if txid not in self.done:
+            self.done[txid] = (request, [(sn, "unt_%032x" % (len(self.done) * 100 + i)) for i, sn in enumerate(serials)])
+        return [(sn, uid) for sn, uid in self.done[txid][1] if sn not in self.unlisted]

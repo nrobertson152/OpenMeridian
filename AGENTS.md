@@ -14,8 +14,11 @@ OpenMeridian follows the same rules as OpenSchematix and RevisionWorx.
 - The core (everything outside `openmeridian/gui`) uses the standard library only. The window uses PySide6.
   `[dev]` extras are for tests and builds only.
 - Windows and Linux; Python 3.10–3.13; PySide6 6.5 or newer.
-- RevisionWorx is the record for engineering. OpenMeridian only reads it, through its command line, and never writes to
-  a workspace. It fails closed: an unreleased revision isn't imported unless the user chooses that.
+- RevisionWorx is the record for engineering. OpenMeridian reads it through its command line. It writes one thing
+  (Director's decision, 2026-11-07): the units its own work orders build, registered in RevisionWorx's unit register
+  through `revisionworx link unit-register`, with a txid derived from the completion so a retry never registers twice.
+  Nothing else is written to a workspace, and nothing is written any other way. It fails closed: an unreleased revision
+  isn't imported unless the user chooses that, and a unit RevisionWorx refuses stays listed as not registered, with why.
 - `.meridian` files must keep opening. Document any format change in `docs/COMPANY_FILE.md`, version it and test it.
 - Money is integer cents and quantities integer thousandths. No floats in stored values.
 - The stock ledger and activity log are append-only, enforced in the file. Every change is one transaction.

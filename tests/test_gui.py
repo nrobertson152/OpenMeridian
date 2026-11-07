@@ -2,7 +2,7 @@
 import os
 
 import pytest
-from conftest import CSV, M, Q, release
+from conftest import CSV, FakeRevisionWorx, M, Q, release
 
 pytest.importorskip("PySide6")
 
@@ -368,3 +368,151 @@ def test_answer_for_a_closed_company_is_ignored(app, qapp, tmp_path, monkeypatch
     _settle(app, qapp)
     assert page.docs == []
     assert QMessageBox is not None
+
+
+def _panel_text(page):
+    from PySide6.QtWidgets import QLabel, QPushButton, QTableWidget
+    texts = [x.text() for x in page.panel.inner.findChildren(QLabel)]
+    for t in page.panel.inner.findChildren(QTableWidget):
+        texts += [t.item(r, c).text() for r in range(t.rowCount()) for c in range(t.columnCount()) if t.item(r, c)]
+    buttons = [b.text() for b in page.panel.inner.findChildren(QPushButton)]
+    return " | ".join(texts), buttons
+
+
+def _serial_work_order(c, qty="2"):
+    part = c.add_item("MOTOR", "Motor", "buy")
+    c.adjust_stock(part, Q("5"), "opening")
+    x = c.add_item("HPU-75", "Hydraulic power unit", "make", tracking="serial")
+    c.set_bom_line(x, part, Q("1"))
+    wo = c.create_work_order(x, Q(qty))
+    c.release_work_order(wo)
+    return wo
+
+
+def test_completing_with_serials_then_registering_through_the_window(app, qapp, tmp_path, monkeypatch):
+    p = str(tmp_path / "c.meridian")
+    Company.create(p, "My Works").close()
+    assert app.open_path(p)
+    c = app.company
+    wo = _serial_work_order(c)
+    c.set_setting("rw_workspace", str(tmp_path / "eng"))
+    fake = FakeRevisionWorx()
+    fake.refuse = ("the workspace is busy: someone else is saving. Try again", "busy")
+    monkeypatch.setattr(app, "rw_client", lambda: fake)
+    page = app.pages["production"]
+    app.go("production", wo)
+    pump(qapp)
+    assert page.panel.primary_button.text() == "Complete…"
+
+    def made(serials):
+        def run(self):
+            assert self.serials is not None, "an item made with serial numbers asks for them"
+            self.serials.setPlainText(serials)
+            self.submit()
+            return self.result()
+        return run
+    monkeypatch.setattr(dlg.CompleteDialog, "exec", made("NH-1"))
+    page.panel.primary_button.click()
+    pump(qapp)
+    assert c.units_built(wo) == [] and c.work_order(wo)["done"] == 0, "one serial for two units: refused, nothing made"
+    monkeypatch.setattr(dlg.CompleteDialog, "exec", made("NH-1\nNH-2"))
+    page.panel.primary_button.click()
+    pump(qapp)
+    assert [u["serial"] for u in c.units_built(wo)] == ["NH-1", "NH-2"] and c.work_order(wo)["status"] == "complete"
+    assert len(app.errors) == 1 and "NH-1, NH-2: the workspace is busy" in app.errors[0]
+    text, buttons = _panel_text(page)
+    assert "Not in RevisionWorx yet" in text and "The 2 units made aren't in its unit register. The workspace is busy" in text
+    assert "UNITS BUILT (2)" in text and text.count("Not registered") == 2
+    assert page.panel.primary_button.text() == "Register in RevisionWorx"
+
+    fake.refuse = None
+    page.panel.primary_button.click()
+    pump(qapp)
+    assert all(u["rw_unit"] for u in c.units_built(wo)) and len(fake.calls) == 2 and fake.calls[0] == fake.calls[1]
+    text, buttons = _panel_text(page)
+    assert "Not in RevisionWorx yet" not in text and text.count("Registered") == 2 and "Register in RevisionWorx" not in buttons
+    assert len(app.errors) == 1
+
+
+def test_without_revisionworx_units_built_are_listed_and_nothing_is_sent(app, qapp, tmp_path, monkeypatch):
+    p = str(tmp_path / "c.meridian")
+    Company.create(p, "My Works").close()
+    assert app.open_path(p)
+    c = app.company
+    wo = _serial_work_order(c, "1")
+    monkeypatch.setattr(app, "rw_client", lambda: pytest.fail("RevisionWorx isn't connected, so it isn't asked"))
+    c.complete_work_order(wo, Q("1"), ["NH-7"])
+    app.go("production", wo)
+    pump(qapp)
+    text, buttons = _panel_text(app.pages["production"])
+    assert "UNITS BUILT (1)" in text and "NH-7" in text and "RevisionWorx" not in text
+    assert "Register in RevisionWorx" not in buttons
+    # the item says it's made with serial numbers, and its ledger says which unit came in
+    app.go("items", c.item_by_number("HPU-75")["id"])
+    pump(qapp)
+    text, _ = _panel_text(app.pages["items"])
+    assert "Each unit made has one" in text and f"{c.work_order(wo)['number']} · NH-7" in text
+
+
+def test_item_dialog_sets_serial_numbers_only_for_items_made(sample, qapp):
+    d = dlg.ItemDialog(sample)
+    d.number.setText("SER-1")
+    assert not d.tracking.isEnabled() and d.tracking.currentData() == "none", "a bought item has no serial numbers here"
+    d.kind.setCurrentIndex(d.kind.findData("make"))
+    assert d.tracking.isEnabled()
+    d.tracking.setCurrentIndex(d.tracking.findData("serial"))
+    d.submit()
+    item = sample.company.item_by_number("SER-1")
+    assert item["tracking"] == "serial" and item["kind"] == "make"
+    # made into a bought item, it stops having them (allowed while none is in stock)
+    e = dlg.ItemDialog(sample, item)
+    assert e.tracking.isEnabled() and e.tracking.currentData() == "serial"
+    e.kind.setCurrentIndex(e.kind.findData("buy"))
+    assert e.tracking.currentData() == "none" and not e.tracking.isEnabled()
+    e.submit()
+    assert sample.company.item_by_number("SER-1")["tracking"] == "none"
+    # the rule is the company's, whatever the window shows
+    f = dlg.ItemDialog(sample)
+    f.number.setText("SER-2")
+    f.tracking.setCurrentIndex(f.tracking.findData("serial"))
+    f.submit()
+    assert "items you make" in f.message.text() and sample.company.item_by_number("SER-2") is None
+
+
+def test_units_made_are_registered_in_the_real_revisionworx_through_the_window(app, qapp, workspace, tmp_path, monkeypatch):
+    w = workspace
+    release(w, w.rev)
+    p = str(tmp_path / "c.meridian")
+    Company.create(p, "My Works").close()
+    assert app.open_path(p)
+    c = app.company
+    c.set_setting("rw_workspace", w.path)
+    part = c.add_item("MOTOR", "Motor", "buy")
+    c.adjust_stock(part, Q("5"), "opening")
+    x = c.add_item("HPU-75", "Hydraulic power unit", "make", tracking="serial")
+    c.set_bom_line(x, part, Q("1"))
+    c.update_item(x, rw_document=w.doc, rw_number="BOM-1")
+    wo = c.create_work_order(x, Q("2"))
+    page = app.pages["production"]
+    app.go("production", wo)
+    pump(qapp)
+    page.panel.primary_button.click()                     # Release: records the released revision from RevisionWorx
+    pump(qapp)
+    assert c.work_order(wo)["build_rw_revision"] == w.rev
+
+    def made(self):
+        self.serials.setPlainText("NH-26-0001\nNH-26-0002")
+        self.submit()
+        return self.result()
+    monkeypatch.setattr(dlg.CompleteDialog, "exec", made)
+    page.panel.primary_button.click()                     # Complete…: then registered in RevisionWorx
+    pump(qapp)
+    assert not app.errors
+    units = c.units_built(wo)
+    assert [u["serial"] for u in units] == ["NH-26-0001", "NH-26-0002"] and all(u["rw_unit"] for u in units)
+    client = app.rw_client()
+    got = client._link("unit", "NH-26-0002")["unit"]
+    assert got["id"] == units[1]["rw_unit"] and got["status"] == "built" and got["model"]["number"] == "HPU-75"
+    assert [d["revision"]["id"] for d in got["documents"]] == [w.rev]
+    text, buttons = _panel_text(page)
+    assert text.count("Registered") == 2 and "Register in RevisionWorx" not in buttons
