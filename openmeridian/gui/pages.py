@@ -214,6 +214,8 @@ class ItemsPage(ListPage):
         ol.setContentsMargins(0, 8, 0, 0)
         facts = [("Cost", c.money(r["cost"])), ("Price", c.money(r["price"])), ("Reorder", f"at {fmt_qty(r['reorder_point'])}, order {fmt_qty(r['reorder_qty'])}"),
                  ("Supplier", r["supplier"] or "—"), ("Lead time", f"{r['lead_days']} days"), ("Bin", r["bin"] or "—")]
+        if r["kind"] == "make":
+            facts.append(("Serial numbers", "Each unit made has one" if r["tracking"] == "serial" else "No"))
         if r["notes"]:
             facts.append(("Notes", r["notes"]))
         ol.addWidget(KeyValues(facts))
@@ -222,7 +224,9 @@ class ItemsPage(ListPage):
         tabs.addTab(self._bom_tab(r), "BOM")
         tabs.addTab(self._engineering_tab(r), "Engineering")
         moves = c.moves(r["id"], 40)
-        m = MiniTable(["When", "Change", "Kind", "Ref"], [(x["time"][:10], fmt_qty(x["qty"]), MOVE_KINDS.get(x["kind"], x["kind"]), x["ref"] or x["note"]) for x in moves], right=(1,), max_rows=8)
+        m = MiniTable(["When", "Change", "Kind", "Ref"], [(x["time"][:10], fmt_qty(x["qty"]), MOVE_KINDS.get(x["kind"], x["kind"]),
+                                                          " · ".join(t for t in (x["ref"] or x["note"], x["serial"]) if t)) for x in moves],
+                      right=(1,), max_rows=8)
         h = QWidget()
         hl = QVBoxLayout(h)
         hl.setContentsMargins(0, 8, 0, 0)
@@ -686,6 +690,10 @@ class ProductionPage(ListPage):
         p.title(r["number"], f"{fmt_qty(r['qty'])} × {r['item_number']} {r['description']}")
         comps = c.work_order_components(r["id"])
         short = [b for b in comps if b["needed"] > b["on_hand"]]
+        units = c.units_built(r["id"])
+        rw_on = bool(c.setting("rw_workspace"))
+        unregistered = [u for u in units if not u["rw_unit"]] if rw_on else []
+        register = ("Register in RevisionWorx", lambda: self._register(r))
         if r["status"] == "draft":
             if short:
                 p.add(StatusBlock(app.theme, "warning", "Parts are short", ", ".join(b["number"] for b in short[:4]) + ". You can still release it; completing it needs the parts."))
@@ -699,13 +707,27 @@ class ProductionPage(ListPage):
                 p.add(StatusBlock(app.theme, "info", f"Building to Rev {r['build_rw_label']}", "Recorded from RevisionWorx when this was released."))
             if short:
                 p.add(StatusBlock(app.theme, "warning", "Parts are short", ", ".join(f"{b['number']} ({fmt_qty(b['on_hand'])} of {fmt_qty(b['needed'])})" for b in short[:4])))
-            p.actions(("Complete…", lambda: self._complete(r)), (), [("Cancel work order", lambda: self._cancel(r))])
+            if unregistered:
+                p.add(self._unregistered_block(units, unregistered))
+            p.actions(("Complete…", lambda: self._complete(r)), [register] if unregistered else (),
+                      [("Cancel work order", lambda: self._cancel(r))])
         elif r["status"] == "complete":
-            p.add(StatusBlock(app.theme, "ok", "Complete", f"Built to Rev {r['build_rw_label']}." if r["build_rw_label"] else "Finished goods are in stock."))
+            if unregistered:
+                p.add(self._unregistered_block(units, unregistered))
+                p.actions(register)
+            else:
+                p.add(StatusBlock(app.theme, "ok", "Complete", f"Built to Rev {r['build_rw_label']}." if r["build_rw_label"] else "Finished goods are in stock."))
         else:
             p.add(StatusBlock(app.theme, "neutral", "Cancelled"))
         p.add(KeyValues([("Made", f"{fmt_qty(r['done'])} of {fmt_qty(r['qty'])} {r['unit']}"), ("Created", r["created"]), ("Due", r["due_date"] or "—"),
                          ("Document", r["rw_number"] or "Not linked")]))
+        if units:
+            p.section(f"Units built ({len(units)})")
+            if rw_on:
+                rows = [(u["serial"], u["made"], "Registered" if u["rw_unit"] else "Not registered") for u in units]
+                p.add(MiniTable(["Serial", "Made", "RevisionWorx"], rows, max_rows=8))
+            else:
+                p.add(MiniTable(["Serial", "Made"], [(u["serial"], u["made"]) for u in units], max_rows=8))
         p.section("Components for what's left")
         if comps:
             p.add(MiniTable(["Item", "Description", "Need", "Have"], [(b["number"], b["description"], fmt_qty(b["needed"]), fmt_qty(b["on_hand"])) for b in comps], right=(2, 3),
@@ -733,12 +755,46 @@ class ProductionPage(ListPage):
         app.act(lambda: app.company.release_work_order(r["id"], **stamp))
 
     def _complete(self, r):
-        left = r["qty"] - r["done"]
-        rows = [{"id": r["id"], "number": r["item_number"], "description": r["description"], "left": left}]
-        d = dlg.QuantitiesDialog(self.app, f"Complete {r['number']}", "Components leave stock and finished goods come in at their actual cost.",
-                                 rows, lambda q: self.app.company.complete_work_order(r["id"], q[r["id"]]), "Complete")
+        app = self.app
+        d = dlg.CompleteDialog(app, r, app.company.item(r["item_id"]))
         if d.exec():
-            self.app.after_change()
+            app.after_change()
+            if app.company.units_built(r["id"]) and app.company.setting("rw_workspace"):
+                self._register(r)
+
+    def _register(self, r):
+        """Register in RevisionWorx the units this work order made that it doesn't have yet (the one thing OpenMeridian
+        writes there). What RevisionWorx refuses stays listed on the work order, with why."""
+        app = self.app
+        client = app.rw_client()
+        if not client or not client.available:
+            app.toast("Not registered in RevisionWorx: it isn't connected. Use Register in RevisionWorx once it is.", "warning")
+            app.after_change()
+            return
+        out = app.run_guarded(lambda: app.company.register_units(r["id"], client))
+        if out is None:
+            app.after_change()
+            return
+        if out["refused"]:
+            why = "; ".join(f"{', '.join(s)}: {w}" for s, w in out["refused"])
+            app.error(f"RevisionWorx didn't register {why}\n\nNothing about them changed in RevisionWorx. They stay "
+                      "listed on the work order, not registered; register them again once that's sorted.")
+        elif out["registered"]:
+            app.toast(f"Registered in RevisionWorx: {', '.join(out['registered'])}", "success")
+        app.after_change()
+
+    def _unregistered_block(self, units, unregistered):
+        """Units made here that RevisionWorx's unit register doesn't have yet, and why, as RevisionWorx said it."""
+        n = len(unregistered)
+        if n == 1:
+            what, unsent = f"{unregistered[0]['serial']} isn't", "It hasn't been sent yet."
+        else:
+            what = f"The {n} units made aren't" if n == len(units) else f"{n} of the {len(units)} units made aren't"
+            unsent = "They haven't been sent yet."
+        why = next((u["rw_note"] for u in unregistered if u["rw_note"]), "")
+        why = why[:1].upper() + why[1:]
+        return StatusBlock(self.app.theme, "warning", "Not in RevisionWorx yet",
+                           f"{what} in its unit register. {why or unsent}")
 
     def _cancel(self, r):
         if dlg.confirm(self.app, "Cancel work order", f"Cancel {r['number']}?", "Cancel work order"):

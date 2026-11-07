@@ -94,6 +94,16 @@ class ItemDialog(FormDialog):
         self.number = self.line("Item number", i.get("number", ""), "Part number")
         self.desc = self.line("Description", i.get("description", ""))
         self.kind = self.combo("Type", [("Buy", "buy"), ("Make", "make")], i.get("kind", "buy"))
+        self.tracking = self.combo("Serial numbers", [("No", "none"), ("Yes: each unit made has one", "serial")],
+                                   i.get("tracking", "none"))
+
+        def made_only():                    # serial numbers are for units made; a bought item has none here
+            make = self.kind.currentData() == "make"
+            self.tracking.setEnabled(make)
+            if not make:
+                self.tracking.setCurrentIndex(self.tracking.findData("none"))
+        self.kind.currentIndexChanged.connect(lambda _i: made_only())
+        made_only()
         self.unit = self.line("Unit", i.get("unit", "EA"))
         self.cost = self.line("Cost", money_text(i.get("cost", 0)))
         self.price = self.line("Price", money_text(i.get("price", 0)))
@@ -114,7 +124,8 @@ class ItemDialog(FormDialog):
         f = dict(number=self.number.text(), description=self.desc.text(), kind=self.kind.currentData(), unit=self.unit.text(),
                  cost=parse_money(self.cost.text(), "the cost"), price=parse_money(self.price.text(), "the price"),
                  reorder_point=parse_qty(self.rp.text(), "the reorder point"), reorder_qty=parse_qty(self.rq.text(), "the reorder quantity"),
-                 supplier_id=self.supplier.currentData(), lead_days=lead, bin=self.bin.text(), notes=self.notes.toPlainText())
+                 supplier_id=self.supplier.currentData(), lead_days=lead, bin=self.bin.text(), notes=self.notes.toPlainText(),
+                 tracking=self.tracking.currentData())
         if self.item:
             c.update_item(self.item["id"], **f)
             return self.item["id"]
@@ -247,6 +258,32 @@ class QuantitiesDialog(QDialog):
             self.message.show()
             return
         self.accept()
+
+
+class CompleteDialog(FormDialog):
+    """Complete a work order: how many were made and, for an item made with serial numbers, the serial of each."""
+
+    def __init__(self, app, wo, item):
+        super().__init__(app, f"Complete {wo['number']}", "Complete")
+        self.wo, self.item = wo, item
+        left = wo["qty"] - wo["done"]
+        intro = "Components leave stock and finished goods come in at their actual cost."
+        if item["tracking"] == "serial":
+            intro += (f" Each {item['number']} made has its own serial number: one per line, as on its plate."
+                      + (" They're registered in RevisionWorx's unit register as built." if app.company.setting("rw_workspace")
+                         else ""))
+        self.form.addRow(label(intro, "muted", wrap=True))
+        self.qty = self.line("Made this time", fmt_qty(left))
+        self.serials = self.area("Serial numbers") if item["tracking"] == "serial" else None
+        if self.serials is not None:
+            self.serials.setFixedHeight(110)
+            self.serials.setPlaceholderText("NH-26-0001\nNH-26-0002")
+
+    def apply(self):
+        q = parse_qty(self.qty.text(), "the quantity made")
+        serials = None if self.serials is None else self.serials.toPlainText().splitlines()
+        self.app.company.complete_work_order(self.wo["id"], q, serials)
+        return q
 
 
 class WorkOrderDialog(FormDialog):

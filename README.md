@@ -37,7 +37,8 @@ Try it without entering anything: choose **Explore a sample company** on the sta
 ## With RevisionWorx
 
 Point a company at a RevisionWorx workspace in **Settings**. RevisionWorx stays the record for engineering, and
-OpenMeridian only ever reads it, through RevisionWorx's own command line.
+OpenMeridian reads it through RevisionWorx's own command line. The one thing it writes there is the units its own work
+orders build (below).
 
 - **Link items** to their controlled documents and see what's released.
 - **Import a BOM from a released revision**, read by RevisionWorx's own BOM reader. Stock, costs and prices stay as they
@@ -46,6 +47,11 @@ OpenMeridian only ever reads it, through RevisionWorx's own command line.
 - **Out of step:** when engineering releases a new revision, the Overview, the sidebar and the item say which BOMs and
   work orders were made from an older one. Nothing changes until someone imports the new one.
 - **Open engineering changes** are shown beside the documents.
+- **Units built go into RevisionWorx's unit register.** An item can be made with serial numbers: completing its work
+  order asks for the serial of each unit, and registers them in RevisionWorx as built, as that item, to the revision the
+  work order was released to. A retry never registers anything twice. Anything RevisionWorx refuses (a serial it already
+  has for another unit, say) stays on the work order as not registered, with RevisionWorx's reason, until it's sorted
+  and registered again. From then on the unit's history is RevisionWorx's, and FieldWorx finds it by its serial plate.
 
 ## What it doesn't do
 
@@ -55,7 +61,9 @@ OpenMeridian is deliberately small, and a simple result mustn't look like an exa
   and one tax rate. Have your accountant check anything you rely on.
 - **Planning is not scheduling.** It ignores capacity and dates of individual demands. The "earliest" date is today plus
   that item's own lead time, without adding the levels below it.
-- **One location and no lots or serial numbers.** Bins are a note on the item.
+- **One location, and serial numbers only for units you make.** Bins are a note on the item. A serial is recorded when
+  a unit is made; shipping doesn't yet record which serial went to which customer, and bought parts have no lots or
+  serials here (RevisionWorx records what's fitted in a unit).
 - **One person at a time.** A company file on your own disk is the supported setup. Using one over a network share has
   **not** been tested, and SQLite's locking can't be relied on over network filesystems.
 - **The logo is placeholder artwork.**

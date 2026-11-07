@@ -1,8 +1,10 @@
-"""RevisionWorx: engineering's controlled record. OpenMeridian reads it and never writes to it.
+"""RevisionWorx: engineering's controlled record. OpenMeridian reads it, and writes one thing: the units its own work
+orders built, registered in RevisionWorx's unit register (the Director's decision, 2026-11-07). Nothing else.
 
-Everything goes through RevisionWorx's public command line (`--json`), so its rules, locks and integrity checks hold.
-Items link to controlled documents, work orders record the released revision being built, BOMs are imported from a
-released revision by RevisionWorx's own validated BOM reader, and open engineering changes are shown where they matter.
+Everything goes through RevisionWorx's public command line (`--json`, and `link` for units), so its rules, locks and
+integrity checks hold. Items link to controlled documents, work orders record the released revision being built, BOMs are
+imported from a released revision by RevisionWorx's own validated BOM reader, and open engineering changes are shown
+where they matter.
 """
 from __future__ import annotations
 
@@ -22,7 +24,13 @@ _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform.star
 
 
 class RevisionWorxError(RuntimeError):
-    """RevisionWorx couldn't answer. The message is its own, or says what to do."""
+    """RevisionWorx couldn't answer. The message is its own, or says what to do. ``kind`` is RevisionWorx's own word for
+    why its ``link`` command refused (``duplicate``, ``txid-used``, ``conflict``, ``busy``...; its docs/INTEGRATION.md),
+    or empty."""
+
+    def __init__(self, message: str = "", kind: str = ""):
+        super().__init__(message)
+        self.kind = kind
 
 
 def is_workspace(folder: str) -> bool:
@@ -185,6 +193,56 @@ class Client:
         rows = data.get("rows", []) if isinstance(data, dict) else data
         return [Change(c.get("id", ""), c.get("number", ""), c.get("kind", ""), c.get("title", ""), c.get("status") or c.get("state", ""))
                 for c in rows or []]
+
+    def _link(self, *args) -> dict:
+        """``revisionworx -w WORKSPACE link ...``: one JSON object back, ``ok`` or not, whatever the exit code."""
+        if self.cmd is None:
+            raise RevisionWorxError("RevisionWorx isn't installed, or OpenMeridian can't find it. Set its location in Settings.")
+        if not is_workspace(self.workspace):
+            raise RevisionWorxError(f"{self.workspace} is not a RevisionWorx workspace.")
+        try:
+            r = subprocess.run([*self.cmd, "-w", self.workspace, "link", *args], capture_output=True, text=True,
+                               timeout=TIMEOUT, check=False, encoding="utf-8", errors="replace", env=child_environment(),
+                               stdin=subprocess.DEVNULL, **_NO_WINDOW)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RevisionWorxError(f"RevisionWorx could not be run: {e}") from e
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        try:
+            data = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            raise RevisionWorxError((r.stderr or r.stdout).strip() or f"RevisionWorx exited with code {r.returncode}.")
+        if not data.get("ok"):
+            raise RevisionWorxError(str(data.get("error") or "RevisionWorx refused."), str(data.get("kind") or ""))
+        return data
+
+    def register_units(self, txid: str, serials: list[str], *, model: str, name: str, built: str, document: str = "",
+                       evidence: str = "") -> list[tuple[str, str]]:
+        """Register units a work order built in RevisionWorx's unit register, all of them or none (``link unit-register``).
+        ``txid`` is the same for every attempt at one completion, so RevisionWorx records them once however often it is
+        asked. ``document`` is the revision they were built to, ``DOC@REV`` (ids). The serials are this organization's
+        (no issuer). Returns (serial, RevisionWorx unit id) pairs for the units it lists."""
+        if "unit-records" not in (self._link("version").get("features") or []):
+            raise RevisionWorxError("This RevisionWorx can't register units. Update it (1.0.0 or later).")
+        # --option=value throughout, so a value starting with "-" (a serial like -0042, say) stays a value
+        args = ["unit-register", f"--txid={txid}", f"--model={model}", "--status=built", f"--built={built}"]
+        args += [f"--serial={sn}" for sn in serials]
+        if name:
+            args.append(f"--name={name}")
+        if document:
+            args.append(f"--doc={document}")
+        if evidence:
+            args.append(f"--evidence={evidence}")
+        out = []
+        for u in self._link(*args).get("units") or []:
+            if not isinstance(u, dict) or not isinstance(u.get("id"), str):
+                continue
+            for i in u.get("identifiers") or []:
+                if (isinstance(i, dict) and i.get("scheme") == "serial" and not i.get("issuer")
+                        and isinstance(i.get("value"), str)):
+                    out.append((i["value"], u["id"]))
+        return out
 
     def read_bom(self, doc_id: str, allow_unreleased: bool = False) -> dict:
         """The BOM in a document's released revision, read by RevisionWorx's own BOM reader.
