@@ -27,6 +27,8 @@ def self_test(report: str) -> int:
             c = sample.build(os.path.join(d, "t.meridian"))
             note(c.summary()["stock_value"] > 0, "sample company built, with stock value")
             note(planning.plan(c), "planning suggests orders")
+            hose = c.item_by_number("HSE-08")
+            note(c.trace_lot(hose["id"], "DM-26-1104")["went"], "a lot traced to what it went into")
             c.backup(os.path.join(d, "b.meridian"))
             note(os.path.exists(os.path.join(d, "b.meridian")), "backup written")
             c.close()

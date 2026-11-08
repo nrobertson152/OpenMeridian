@@ -170,9 +170,12 @@ QComboBox::drop-down {{ border: none; width: 18px; }}
 QComboBox QAbstractItemView {{ background: {u['surface']}; border: 1px solid {u['border_strong']}; selection-background-color: {u['select_bg']}; selection-color: {u['select_fg']}; outline: 0; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {u['border_strong']}; border-radius: 3px; background: {u['input']}; }}
 QCheckBox::indicator:checked {{ background: {u['accent']}; border-color: {u['accent']}; }}
-QTableView, QTableWidget, QListWidget {{ background: {u['surface']}; border: none; gridline-color: {u['border']}; outline: 0; selection-background-color: {u['select_bg']}; selection-color: {u['select_fg']}; }}
+QTableView, QTableWidget, QListWidget, QTreeView {{ background: {u['surface']}; border: none; gridline-color: {u['border']}; outline: 0; selection-background-color: {u['select_bg']}; selection-color: {u['select_fg']}; }}
 QTableView::item {{ padding: 0 8px; border-bottom: 1px solid {u['border']}; }}
 QTableView::item:selected {{ background: {u['select_bg']}; color: {u['select_fg']}; }}
+QTreeView {{ color: {u['text']}; }}
+QTreeView::item {{ padding: 2px 4px; }}
+QTreeView::item:selected {{ background: {u['select_bg']}; color: {u['select_fg']}; }}
 QListWidget::item {{ padding: 6px 8px; border-radius: 4px; }}
 QListWidget::item:hover {{ background: {u['hover']}; }}
 QListWidget::item:selected {{ background: {u['select_bg']}; color: {u['select_fg']}; }}
