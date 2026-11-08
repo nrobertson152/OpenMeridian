@@ -999,6 +999,64 @@ class Company:
         out["went"] = self._went(item, lot, moves, out, 0, {(item_id, lot)})
         return out
 
+    def lots_received(self, supplier_id=None, item_id=None, since="", until="") -> list[dict]:
+        """Lots received on purchase orders, by supplier, item and date received (``since`` and ``until`` are days, both
+        included), for a recall a supplier announces. Each: ``item_id``, ``number``, ``description``, ``lot``,
+        ``received`` (how much came in), ``first`` and ``last`` (days), ``orders`` (the orders it came on, in order),
+        ``supplier_id`` and ``supplier``, and ``on_hand`` now. Oldest first within each item."""
+        where, args = ["m.kind = 'receipt'", "m.lot <> ''"], []
+        if supplier_id is not None:
+            where.append("o.supplier_id = ?")
+            args.append(supplier_id)
+        if item_id is not None:
+            where.append("m.item_id = ?")
+            args.append(item_id)
+        if since:
+            where.append("substr(m.time, 1, 10) >= ?")
+            args.append(since)
+        if until:
+            where.append("substr(m.time, 1, 10) <= ?")
+            args.append(until)
+        moves = ("FROM stock_moves m JOIN items i ON i.id = m.item_id JOIN purchase_orders o ON o.number = m.ref "
+                 "JOIN contacts c ON c.id = o.supplier_id WHERE " + " AND ".join(where))
+        rows = self._rows("SELECT m.item_id, i.number, i.description, m.lot, SUM(m.qty) AS received, MIN(m.time) AS first, "
+                          "MAX(m.time) AS last, MIN(m.id) AS first_id, o.supplier_id, c.name AS supplier " + moves
+                          + " GROUP BY m.item_id, m.lot, o.supplier_id ORDER BY i.number COLLATE NOCASE, first_id", *args)
+        for r in rows:
+            r["first"], r["last"] = r["first"][:10], r["last"][:10]
+            r["orders"] = [x["ref"] for x in self._rows(
+                "SELECT m.ref " + moves + " AND m.item_id = ? AND m.lot = ? AND o.supplier_id = ? GROUP BY m.ref "
+                "ORDER BY MIN(m.id)", *args, r["item_id"], r["lot"], r["supplier_id"])]
+            r["on_hand"] = self.lot_on_hand(r["item_id"], r["lot"])
+            del r["first_id"]
+        return rows
+
+    def trace_lots(self, lots) -> dict:
+        """Several lots traced at once, for a recall: ``traces``, each lot's own trace (as :meth:`trace_lot`), and what they
+        reached together, each thing once: ``units``, ``shipments``, ``in_stock``, ``untracked`` and ``lots`` (every lot
+        traced or made from them). ``lots`` is a list of (item id, lot)."""
+        if not lots:
+            raise ERPError("Choose at least one lot to trace.")
+        traces, named = [], set()
+        for item_id, lot in lots:
+            t = self.trace_lot(item_id, lot)
+            if (t["item"], t["lot"]) not in named:          # a lot named twice, in any case, is traced once
+                named.add((t["item"], t["lot"]))
+                traces.append(t)
+        out = {"traces": traces, "cut_short": any(t["cut_short"] for t in traces)}
+        keys = {"units": ("item", "serial"), "shipments": ("item", "lot", "order"), "in_stock": ("item", "lot"),
+                "untracked": ("item", "order"), "lots": ("item", "lot")}
+        for name, key in keys.items():
+            seen, merged = set(), []
+            for t in traces:
+                for row in t[name]:
+                    k = tuple(row[f] for f in key)
+                    if k not in seen:
+                        seen.add(k)
+                        merged.append(row)
+            out[name] = merged
+        return out
+
     def _lot_moves(self, item_id, lot) -> list[dict]:
         return self._rows("SELECT * FROM stock_moves WHERE item_id = ? AND lot = ? COLLATE NOCASE AND lot <> '' ORDER BY id",
                           item_id, unicodedata.normalize("NFC", _clean(lot)))

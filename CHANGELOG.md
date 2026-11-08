@@ -27,5 +27,8 @@ warnings and open engineering changes).
   made from the lot is (status, customer, site, location). It also lists units the register records the lot, or a lot
   made from it, fitted in, which the stock ledger can't know about: a spare fitted on site, say. The answer goes into
   the CSV. Needs RevisionWorx's `unit-where-used` feature for the second part, and says so when it isn't there.
+- **A supplier's recall.** On a supplier's page, **Recall…** lists the lots it sent, by item and by the day they came in,
+  and traces the ones ticked together: what they reached, each unit and customer once, then each lot's trace. **Where are
+  they now?** asks RevisionWorx about every lot reached, and **Save as CSV** keeps it all.
 - **Company file format 3** adds lots. Format 2 files are upgraded when opened, with a verified copy kept beside them
   first (`NAME (format 2 backup).meridian`).

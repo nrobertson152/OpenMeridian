@@ -386,7 +386,10 @@ class ContactsPage(ListPage):
         p.title(r["name"], r["contact"])
         new_label = "New sales order" if self.kind == "customer" else "New purchase order"
         target = "sales" if self.kind == "customer" else "purchasing"
-        p.actions((new_label, lambda: self.app.pages[target].new_for_party(r["id"])), [("Edit", self.on_activate)])
+        more = [("Edit", self.on_activate)]
+        if self.kind == "supplier" and c.lots_received(r["id"]):
+            more.append(("Recall…", lambda: self.recall(r["id"])))
+        p.actions((new_label, lambda: self.app.pages[target].new_for_party(r["id"])), more)
         p.add(KeyValues([("Email", r["email"] or "—"), ("Phone", r["phone"] or "—"), ("Address", r["address"] or "—"), ("Terms", f"{r['terms_days']} days")]
                         + ([("Notes", r["notes"])] if r["notes"] else [])))
         p.section("Orders")
@@ -399,6 +402,13 @@ class ContactsPage(ListPage):
                             on_activate=lambda i: self.app.go(target, orders[i]["id"]), max_rows=8))
         else:
             p.add(label("No orders yet.", "muted"))
+
+
+    def recall(self, supplier_id):
+        """The supplier announces a recall: trace the lots it sent (RecallDialog)."""
+        d = self.app.run_guarded(lambda: dlg.RecallDialog(self.app, supplier_id))
+        if d is not None:
+            d.exec()
 
 
 class CustomersPage(ContactsPage):

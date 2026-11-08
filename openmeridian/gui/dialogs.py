@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import platform
 import webbrowser
+from datetime import date
 
 from PySide6 import __version__ as pyside_version
 from PySide6.QtCore import Qt, qVersion
@@ -515,29 +516,48 @@ class PickDialog(QDialog):
 
 
 class TraceDialog(QDialog):
-    """Where a lot came from and where it went (Company.trace_lot), with what it reached said first, for a recall."""
+    """Where a lot came from and where it went (Company.trace_lot), with what it reached said first, for a recall. Given
+    ``lots`` instead, several lots at once (Company.trace_lots): what they reached together, then each lot's own trace."""
 
     COLUMNS = ["What", "Item", "Lot or serial", "Qty", "Reference", "Customer or supplier", "Date", "Note"]
 
-    def __init__(self, app, item_id, lot):
+    def __init__(self, app, item_id=None, lot=None, *, lots=None, title=""):
         super().__init__(app.window)
         self.app = app
-        self.trace = t = app.company.trace_lot(item_id, lot)
-        self.setWindowTitle(f"Trace lot {t['lot']} of {t['item']}")
+        self.several = lots is not None
+        if self.several:
+            self.trace = t = app.company.trace_lots(lots)
+            n = len(t["traces"])
+            self.heading = title or f"{n} lot{'s' if n != 1 else ''}"
+            self.setWindowTitle(f"Recall: {self.heading}")
+            summary = tracing.recall_summary(t)
+        else:
+            self.trace = t = app.company.trace_lot(item_id, lot)
+            self.heading = f"Lot {t['lot']} of {t['item']} ({t['description']})"
+            self.setWindowTitle(f"Trace lot {t['lot']} of {t['item']}")
+            summary = tracing.summary(t)
         self.resize(980, 560)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 14)
-        lay.addWidget(StatusBlock(app.theme, "info", f"Lot {t['lot']} of {t['item']} ({t['description']})", tracing.summary(t)))
+        lay.addWidget(StatusBlock(app.theme, "info", self.heading, summary))
         self.tree = QTreeWidget()
         self.tree.setColumnCount(len(self.COLUMNS))
         self.tree.setHeaderLabels(self.COLUMNS)
         self.tree.setUniformRowHeights(True)
-        for key, title in tracing.SECTIONS:
-            top = QTreeWidgetItem([title])
-            self.tree.addTopLevelItem(top)
-            self._add(top, t[key])
-            if not t[key]:
-                top.addChild(QTreeWidgetItem(["Nothing recorded"]))
+        for one in (t["traces"] if self.several else [t]):
+            parent = None
+            if self.several:
+                parent = QTreeWidgetItem([f"{one['item']} lot {one['lot']}", one["item"], one["lot"]])
+                self.tree.addTopLevelItem(parent)
+            for key, section in tracing.SECTIONS:
+                top = QTreeWidgetItem([section])
+                if parent is None:
+                    self.tree.addTopLevelItem(top)
+                else:
+                    parent.addChild(top)
+                self._add(top, one[key])
+                if not one[key]:
+                    top.addChild(QTreeWidgetItem(["Nothing recorded"]))
         self.tree.expandAll()
         for col in range(len(self.COLUMNS)):
             self.tree.resizeColumnToContents(col)
@@ -595,24 +615,131 @@ class TraceDialog(QDialog):
         top.setExpanded(True)
         for col in range(len(self.COLUMNS)):
             self.tree.resizeColumnToContents(col)
-        self.rw_text.setText(tracing.rw_summary(self.rw))
+        self.rw_text.setText(tracing.rw_summary(self.rw, "them" if self.several else "it"))
         self.rw_text.show()
         self.ask.setEnabled(False)
 
     def save_csv(self, path=None):
         t = self.trace
         if path is None:
-            path, _ = QFileDialog.getSaveFileName(self, "Save the trace", f"Trace {t['item']} lot {t['lot']}.csv",
-                                                  "CSV file (*.csv)")
+            name = f"Recall {self.heading}.csv" if self.several else f"Trace {t['item']} lot {t['lot']}.csv"
+            path, _ = QFileDialog.getSaveFileName(self, "Save the trace", name, "CSV file (*.csv)")
         if not path:
             return
+        rows = tracing.recall_rows(t) if self.several else tracing.rows(t)
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                f.write(to_csv(tracing.HEADERS, tracing.rows(t) + (tracing.rw_rows(self.rw) if self.rw else [])))
+                f.write(to_csv(tracing.HEADERS, rows + (tracing.rw_rows(self.rw) if self.rw else [])))
         except OSError as e:
             self.app.error(str(e))
             return
         self.app.toast("Trace saved", "success")
+
+
+class RecallDialog(QDialog):
+    """A supplier announces a recall: the lots it sent, to trace together (Company.lots_received, then trace_lots). Every lot
+    shown is ticked; untick the ones the recall doesn't name."""
+
+    COLUMNS = ["", "Item", "Lot", "Received", "First in", "Last in", "Orders", "On hand"]
+
+    def __init__(self, app, supplier_id):
+        super().__init__(app.window)
+        self.app, self.supplier_id = app, supplier_id
+        self.supplier = app.company.contact(supplier_id)["name"]
+        self.setWindowTitle(f"Recall: lots from {self.supplier}")
+        self.resize(860, 520)
+        self.lots: list[dict] = []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.addWidget(StatusBlock(app.theme, "info", f"Lots received from {self.supplier}",
+                                  "Tick the lots the recall names, or show one item's lots received between two dates. "
+                                  "Each is traced whole: into what was made from it and who it was shipped to."))
+        row = QHBoxLayout()
+        self.item = Combo()
+        self.item.addItem("Every item", None)
+        items = {}
+        for x in app.company.lots_received(supplier_id):
+            items.setdefault(x["item_id"], f"{x['number']}  {x['description']}")
+        for item_id, text in sorted(items.items(), key=lambda kv: kv[1].casefold()):
+            self.item.addItem(text, item_id)
+        self.since, self.until = QLineEdit(), QLineEdit()
+        for box, hint in ((self.since, "From YYYY-MM-DD"), (self.until, "To YYYY-MM-DD")):
+            box.setPlaceholderText(hint)
+            box.setToolTip("Lots received on or after this day" if box is self.since else "Lots received on or before this day")
+            box.setFixedWidth(150)
+        row.addWidget(self.item, 1)
+        row.addWidget(self.since)
+        row.addWidget(self.until)
+        lay.addLayout(row)
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.table, 1)
+        self.problem = label("", "small", wrap=True)
+        self.problem.hide()
+        lay.addWidget(self.problem)
+        box = QDialogButtonBox()
+        self.go = box.addButton("Trace these", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.go.setObjectName("primary")
+        self.go.setDefault(True)
+        box.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+        box.accepted.connect(self.trace)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+        self.item.currentIndexChanged.connect(lambda _i: self.load())
+        self.since.textChanged.connect(lambda _t: self.load())
+        self.until.textChanged.connect(lambda _t: self.load())
+        self.load()
+
+    def _day(self, box) -> str | None:
+        """The day typed, "" for none, or None if it isn't a day."""
+        text = box.text().strip()
+        if not text:
+            return ""
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            return None
+
+    def load(self):
+        since, until = self._day(self.since), self._day(self.until)
+        if since is None or until is None:
+            self.problem.setText("Write dates as YYYY-MM-DD, for example 2026-03-01.")
+            self.problem.show()
+            return
+        self.problem.hide()
+        self.lots = self.app.company.lots_received(self.supplier_id, self.item.currentData(), since, until)
+        self.table.setRowCount(len(self.lots))
+        for r, x in enumerate(self.lots):
+            tick = QTableWidgetItem()
+            tick.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            tick.setCheckState(Qt.CheckState.Checked)
+            self.table.setItem(r, 0, tick)
+            for c, text in enumerate([x["number"], x["lot"], fmt_qty(x["received"]), x["first"], x["last"],
+                                      ", ".join(x["orders"]), fmt_qty(x["on_hand"])], 1):
+                cell = _fixed(text)
+                if c in (3, 7):                                      # quantities line up on the right, as everywhere
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(r, c, cell)
+        self.table.resizeColumnsToContents()
+        self.go.setEnabled(bool(self.lots))
+
+    def chosen(self) -> list[tuple[int, str]]:
+        return [(x["item_id"], x["lot"]) for r, x in enumerate(self.lots)
+                if self.table.item(r, 0).checkState() == Qt.CheckState.Checked]
+
+    def trace(self):
+        lots = self.chosen()
+        if not lots:
+            self.app.toast("Tick at least one lot.")
+            return
+        n = len(lots)
+        d = self.app.run_guarded(lambda: TraceDialog(self.app, lots=lots,
+                                                     title=f"{n} lot{'s' if n != 1 else ''} from {self.supplier}"))
+        if d is not None:
+            d.exec()
 
 
 class SettingsDialog(FormDialog):
