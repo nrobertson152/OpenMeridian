@@ -27,8 +27,9 @@ you can optionally [support development on Ko-fi](https://ko-fi.com/nr270343).
 - **Production.** Work orders that reserve parts, consume them on completion and show what's short.
 - **Lots.** A part bought or made in lots says which lot at every step: received as the supplier's lot, used on a work
   order, made as a lot of its own, shipped. **Trace** follows a lot to the lots and units made from it and the
-  customers they were shipped to, and back to where it came from, for a recall. Lots to use are filled in oldest first,
-  for you to check: what's recorded is what you say went.
+  customers they were shipped to, and back to where it came from, for a recall. When a supplier recalls lots it sent,
+  **Recall…** on the supplier finds them by item and date and traces them together. Lots to use are filled in oldest
+  first, for you to check: what's recorded is what you say went.
 - **Planning.** What to buy and make to cover demand and reorder points, through every BOM level. You review the
   suggestions, and they become draft orders.
 - **Find anything.** Ctrl+K searches every record. Every list has filters and a panel for what you've selected, with

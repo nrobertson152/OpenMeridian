@@ -357,6 +357,88 @@ def test_a_recall_follows_a_lot_into_what_was_made_from_it_and_who_has_it(plant)
         c.trace_lot(p.hose, "H-9")
 
 
+def test_a_suppliers_lots_are_found_by_item_and_the_day_they_came_in(plant, monkeypatch):
+    """A supplier announces a recall of lots it sent between two dates: find them, with the orders they came on."""
+    p, c = plant, plant.c
+    today = c.lots_received(p.sup)[0]["first"]
+    other = c.add_contact("supplier", "Other Hoses")
+    po2 = c.create_purchase_order(other)
+    l2 = c.add_purchase_line(po2, p.hose, Q("5"), M("5"))
+    c.place_purchase_order(po2)
+    po3 = c.create_purchase_order(p.sup)
+    l3 = c.add_purchase_line(po3, p.hose, Q("9"), M("5"))
+    c.place_purchase_order(po3)
+    monkeypatch.setattr(company_module, "_now", lambda: "2026-03-02T09:00:00")
+    c.receive_purchase_order(po2, None, {l2: "OH-1"})
+    c.receive_purchase_order(po3, {l3: Q("3")}, {l3: "h-2611"})                    # more of a lot that came before
+    monkeypatch.setattr(company_module, "_now", lambda: "2026-04-15T09:00:00")
+    c.receive_purchase_order(po3, {l3: Q("6")}, {l3: "H-2613"})
+    rows = c.lots_received(p.sup)
+    assert [(x["number"], x["lot"], x["received"], x["orders"], x["supplier"]) for x in rows] == [
+        ("HSE", "H-2611", Q("9"), ["PO-00001", "PO-00003"], "Hose Co"), ("HSE", "H-2612", Q("4"), ["PO-00001"], "Hose Co"),
+        ("HSE", "H-2613", Q("6"), ["PO-00003"], "Hose Co")]
+    assert (rows[0]["first"], rows[0]["last"], rows[0]["on_hand"]) == ("2026-03-02", today, Q("9"))
+    spring = c.lots_received(p.sup, since="2026-03-01", until="2026-04-30")
+    assert [(x["lot"], x["received"], x["orders"]) for x in spring] == [("H-2611", Q("3"), ["PO-00003"]),
+                                                                     ("H-2613", Q("6"), ["PO-00003"])]
+    assert [x["lot"] for x in c.lots_received(other)] == ["OH-1"]
+    assert [x["lot"] for x in c.lots_received(p.sup, p.bolt)] == []                # bolts aren't tracked by lot
+    assert len(c.lots_received()) == 4
+
+
+def test_lots_traced_together_say_what_they_reached_once(plant):
+    p, c = plant, plant.c
+    kits = _released(c, p.kit, "3")
+    c.complete_work_order(kits, Q("3"), lots={p.hose: [("H-2611", Q("6"))]})
+    units = _released(c, p.hpu, "2")
+    c.complete_work_order(units, Q("2"), ["NH-1", "NH-2"], lots={p.kit: [("WO-00001", Q("2"))]})
+    so = c.create_sales_order(p.other)
+    line = c.add_sales_line(so, p.kit, Q("1"))
+    c.confirm_sales_order(so)
+    c.ship_sales_order(so, None, {line: [("WO-00001", Q("1"))]})
+    plain = c.add_item("PLAIN", "Untracked thing", "make")
+    c.set_bom_line(plain, p.hose, Q("1"))
+    loose = _released(c, plain, "2")
+    c.complete_work_order(loose, Q("2"), lots={p.hose: [("H-2612", Q("2"))]})
+
+    r = c.trace_lots([(p.hose, "H-2611"), (p.hose, "H-2612"), (p.hose, "h-2611"), (p.kit, "WO-00001")])
+    assert [(t["item"], t["lot"]) for t in r["traces"]] == [("HSE", "H-2611"), ("HSE", "H-2612"), ("KIT", "WO-00001")]
+    assert [u["serial"] for u in r["units"]] == ["NH-1", "NH-2"]                    # reached twice, listed once
+    assert [(s["item"], s["lot"], s["order"], s["customer"]) for s in r["shipments"]] == [
+        ("KIT", "WO-00001", "SO-00001", "Bayside")]
+    assert r["in_stock"] == [{"item": "HSE", "lot": "H-2612", "qty": Q("2")}]
+    assert [u["item"] for u in r["untracked"]] == ["PLAIN"] and not r["cut_short"]
+    assert r["lots"] == [{"item": "HSE", "lot": "H-2611"}, {"item": "KIT", "lot": "WO-00001"},
+                         {"item": "HSE", "lot": "H-2612"}]
+    assert tracing.recall_summary(r) == (
+        "3 lots traced; 2 units were made from them (NH-1, NH-2); 1 shipment carried them or what was made from them, to "
+        "Bayside; 2 of HSE lot H-2612 is still in stock. Some went into PLAIN, which isn't tracked by lot or serial, so "
+        "where that went can't be followed.")
+    rows = tracing.recall_rows(r)
+    assert rows[0][:5] == ["HSE lot H-2611: Where it came from", "0", "Received", "HSE", "H-2611"]
+    assert {row[0] for row in rows} == {f"{i} lot {l}: {s}" for i, l in (("HSE", "H-2611"), ("HSE", "H-2612"), ("KIT", "WO-00001"))
+                                        for s in ("Where it came from", "Where it went")}
+    with pytest.raises(ERPError, match="at least one lot"):
+        c.trace_lots([])
+    with pytest.raises(ERPError, match="HSE has no lot H-9"):
+        c.trace_lots([(p.hose, "H-2611"), (p.hose, "H-9")])
+
+
+def test_revisionworx_is_asked_about_every_lot_a_recall_reached(plant):
+    p, c = plant, plant.c
+    kits = _released(c, p.kit, "2")
+    c.complete_work_order(kits, Q("2"), lots={p.hose: [("H-2611", Q("4"))]})
+    r = c.trace_lots([(p.hose, "H-2611"), (p.hose, "H-2612")])
+    spare = {"unit": _summary("unt_" + "9" * 32, "NH-9", "Bayside"), "position": "H3", "current": True,
+             "fitted_on": "2026-11-20"}
+    register = Register([], fitted={("kit", "wo-00001"): [spare]})
+    found = tracing.in_revisionworx(r, register)
+    assert register.asked == [("HSE", "H-2611", True), ("KIT", "WO-00001", True), ("HSE", "H-2612", True)]
+    assert [(f["item"], f["lot"], f["unit"]["label"]) for f in found["fitted"]] == [("KIT", "WO-00001", "NH-9")]
+    assert tracing.rw_summary(found, "them") == ("RevisionWorx records them, or lots made from them, fitted in NH-9, "
+                                                 "which the stock ledger can't know.")
+
+
 def test_tracing_a_made_lot_back_shows_what_went_into_it(plant):
     p, c = plant, plant.c
     wo = _released(c, p.kit, "4")

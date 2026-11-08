@@ -777,3 +777,55 @@ def test_a_trace_asks_revisionworx_where_the_units_are_only_when_asked(app, qapp
     e.ask.click()
     pump(qapp)
     assert app.errors and "couldn't answer, so nothing was added" in app.errors[-1] and e.tree.topLevelItemCount() == 2
+
+
+def test_a_supplier_recall_traces_the_lots_it_sent(app, qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QPushButton
+    c, sup, _cus, hose, kit, po, line = _lot_company(app, tmp_path)
+    plain = c.add_contact("supplier", "Bolt Co")
+    app.go("suppliers", plain)
+    pump(qapp)
+    texts = [b.text() for b in app.pages["suppliers"].panel.findChildren(QPushButton)]
+    assert "Recall…" not in texts, "a supplier that never sent a lot has nothing to recall"
+    c.receive_purchase_order(po, {line: Q("4")}, {line: "H-1"})
+    c.receive_purchase_order(po, {line: Q("6")}, {line: "H-2"})
+    app.go("suppliers", sup)
+    pump(qapp)
+    recall = [b for b in app.pages["suppliers"].panel.findChildren(QPushButton) if b.text() == "Recall…"]
+    assert len(recall) == 1
+    opened = []
+    monkeypatch.setattr(dlg.RecallDialog, "exec", lambda self: opened.append(self) or 0)
+    recall[0].click()
+    pump(qapp)
+    d = opened[0]
+    assert d.windowTitle() == "Recall: lots from Hose Co"
+    assert [(d.table.item(r, 1).text(), d.table.item(r, 2).text(), d.table.item(r, 3).text()) for r in range(d.table.rowCount())] == [
+        ("HSE", "H-1", "4"), ("HSE", "H-2", "6")]
+    assert d.chosen() == [(hose, "H-1"), (hose, "H-2")]                      # every lot shown is ticked
+    d.table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert d.chosen() == [(hose, "H-1")]
+    traced = []
+    monkeypatch.setattr(dlg.TraceDialog, "exec", lambda self: traced.append(self) or 0)
+    d.go.click()
+    pump(qapp)
+    t = traced[0]
+    assert t.several and t.windowTitle() == "Recall: 1 lot from Hose Co"
+    top = t.tree.topLevelItem(0)
+    assert t.tree.topLevelItemCount() == 1 and top.text(0) == "HSE lot H-1"
+    assert [top.child(i).text(0) for i in range(top.childCount())] == ["Where it came from", "Where it went"]
+    t.save_csv(str(tmp_path / "recall.csv"))
+    assert "HSE lot H-1: Where it came from,0,Received,HSE,H-1,4,PO-00001,Hose Co" in (tmp_path / "recall.csv").read_text(encoding="utf-8-sig")
+    d.since.setText("March")                                                  # not a day: said, and nothing changes
+    assert d.problem.isVisibleTo(d) and d.table.rowCount() == 2
+    d.since.setText("")
+    d.until.setText("2000-01-01")                                             # before anything came in
+    assert not d.problem.isVisibleTo(d) and d.table.rowCount() == 0 and not d.go.isEnabled()
+    d.until.setText("")
+    d.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    d.table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+    toasts = []
+    monkeypatch.setattr(app, "toast", lambda text, kind="info": toasts.append(text))
+    d.trace()
+    assert len(traced) == 1 and toasts == ["Tick at least one lot."]
+    assert not app.errors

@@ -55,6 +55,47 @@ def rows(t) -> list[list[str]]:
     return out
 
 
+# ---- several lots at once, for a recall a supplier announces (Company.trace_lots)
+def recall_summary(r) -> str:
+    """What the lots reached together, said as :func:`summary` says it of one."""
+    traced = {(t["item"], t["lot"]) for t in r["traces"]}
+    own = [s for s in r["in_stock"] if (s["item"], s["lot"]) in traced]
+    made = [s for s in r["in_stock"] if s not in own]
+    n = len(r["traces"])
+    parts = [f"{n} lot{'s' if n != 1 else ''} traced"]
+    if r["units"]:
+        k = len(r["units"])
+        parts.append(f"{k} unit{'s were' if k != 1 else ' was'} made from them ({_names(u['serial'] for u in r['units'])})")
+    if r["shipments"]:
+        k = len(r["shipments"])
+        who = _names(dict.fromkeys(s["customer"] or "a customer no longer on file" for s in r["shipments"]))
+        parts.append(f"{k} shipment{'s' if k != 1 else ''} carried them or what was made from them, to {who}")
+    if made:
+        parts.append(_names(f"{fmt_qty(s['qty'])} of {s['item']} lot {s['lot']}" for s in made) + " made from them "
+                     + ("is" if len(made) == 1 else "are") + " in stock")
+    if own:
+        parts.append(_names(f"{fmt_qty(s['qty'])} of {s['item']} lot {s['lot']}" for s in own) + " "
+                     + ("is" if len(own) == 1 else "are") + " still in stock")
+    if len(parts) == 1:
+        parts.append("none of them is in stock, and they went into nothing that is tracked")
+    text = "; ".join(parts) + "."
+    if r["untracked"]:
+        text += (" Some went into " + _names(dict.fromkeys(u["item"] for u in r["untracked"]))
+                 + ", which isn't tracked by lot or serial, so where that went can't be followed.")
+    if r["cut_short"]:
+        text += " A trace stopped after many levels of assemblies; trace the last lots shown to go further."
+    return text
+
+
+def recall_rows(r) -> list[list[str]]:
+    """Each lot's trace as :func:`rows` gives it, its section naming the lot."""
+    out = []
+    for t in r["traces"]:
+        for row in rows(t):
+            out.append([f"{t['item']} lot {t['lot']}: {row[0]}", *row[1:]])
+    return out
+
+
 # ---- what RevisionWorx's unit register says of what a lot reached (read-only; docs/COMPANY_FILE.md, Tracing a lot)
 def in_revisionworx(t, client) -> dict:
     """What RevisionWorx's unit register says of what lot trace ``t`` reached, asked through ``client`` (a
@@ -103,21 +144,23 @@ def _where(u) -> str:
     return ", ".join(x for x in (u.get("customer", ""), u.get("site", ""), u.get("location", "")) if x) or "not recorded"
 
 
-def rw_summary(r) -> str:
-    """The register's answer in a sentence or two."""
+def rw_summary(r, it="it") -> str:
+    """The register's answer in a sentence or two. ``it`` is what was traced: "it" for a lot, "them" for several."""
     n = len(r["units"])
     found = [u for u in r["units"] if u["found"]]
     parts = []
+    lot = "a lot" if it == "it" else "lots"
     if n:
-        parts.append(f"RevisionWorx has {len(found)} of the {n} unit{'s' if n != 1 else ''} made from it"
+        parts.append(f"RevisionWorx has {len(found)} of the {n} unit{'s' if n != 1 else ''} made from {it}"
                      + ("" if len(found) == n else
                         f"; not {_names(u['serial'] for u in r['units'] if not u['found'])}") + ".")
     who = "It also" if parts else "RevisionWorx"
     if r["fitted"]:
         units = _names(dict.fromkeys(f["unit"].get("label", "?") for f in r["fitted"]))
-        parts.append(f"{who} records it, or a lot made from it, fitted in {units}, which the stock ledger can't know.")
+        parts.append(f"{who} records {it}, or {lot} made from {it}, fitted in {units}, which the stock ledger can't know.")
     elif not r["note"]:
-        parts.append(f"{who} records it fitted in no other unit." if parts else "RevisionWorx records it fitted in no unit.")
+        parts.append(f"{who} records {it} fitted in no other unit." if parts else
+                     f"RevisionWorx records {it} fitted in no unit.")
     if r["note"]:
         parts.append(r["note"])
     return " ".join(parts) or "RevisionWorx has nothing more on it."

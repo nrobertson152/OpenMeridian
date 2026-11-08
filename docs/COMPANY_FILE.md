@@ -109,6 +109,13 @@ With RevisionWorx connected, **Where are they now?** asks its unit register, and
 - Nothing is written to RevisionWorx, and nothing it says is kept in the company file. Saving the trace as CSV includes
   the answer.
 
+**A supplier's recall.** A supplier announces a recall of lots it sent. On the supplier's page, **Recall…** lists the lots
+received from that supplier, from purchase orders' receipts (`Company.lots_received`): by item and by the day they came
+in, with how much came, the orders they came on and what's on hand now. Every lot listed is ticked; untick the ones the
+recall doesn't name. **Trace these** traces them together (`Company.trace_lots`): what they reached, each unit, shipment,
+stock and lot once, then each lot's own trace. **Where are they now?** and **Save as CSV** work as for one lot, asking
+RevisionWorx about every lot reached. Nothing new is stored: no change to the company file.
+
 ## Upgrading an older file
 
 When OpenMeridian opens a file of an older format, it takes the write lock (`BEGIN IMMEDIATE`) and then:
