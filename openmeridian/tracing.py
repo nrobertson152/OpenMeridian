@@ -112,11 +112,12 @@ def rw_summary(r) -> str:
         parts.append(f"RevisionWorx has {len(found)} of the {n} unit{'s' if n != 1 else ''} made from it"
                      + ("" if len(found) == n else
                         f"; not {_names(u['serial'] for u in r['units'] if not u['found'])}") + ".")
+    who = "It also" if parts else "RevisionWorx"
     if r["fitted"]:
         units = _names(dict.fromkeys(f["unit"].get("label", "?") for f in r["fitted"]))
-        parts.append(f"It also records it, or a lot made from it, fitted in {units}, which the stock ledger can't know.")
+        parts.append(f"{who} records it, or a lot made from it, fitted in {units}, which the stock ledger can't know.")
     elif not r["note"]:
-        parts.append("It records it fitted in no other unit.")
+        parts.append(f"{who} records it fitted in no other unit." if parts else "RevisionWorx records it fitted in no unit.")
     if r["note"]:
         parts.append(r["note"])
     return " ".join(parts) or "RevisionWorx has nothing more on it."

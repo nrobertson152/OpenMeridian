@@ -593,6 +593,8 @@ class TraceDialog(QDialog):
         if not rows:
             top.addChild(QTreeWidgetItem(["Nothing recorded"]))
         top.setExpanded(True)
+        for col in range(len(self.COLUMNS)):
+            self.tree.resizeColumnToContents(col)
         self.rw_text.setText(tracing.rw_summary(self.rw))
         self.rw_text.show()
         self.ask.setEnabled(False)

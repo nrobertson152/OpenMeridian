@@ -467,6 +467,12 @@ def test_a_unit_revisionworx_doesnt_have_and_an_older_revisionworx_are_said_plai
     assert tracing.rw_summary(r) == ("RevisionWorx has 1 of the 2 units made from it; not NH-2. This RevisionWorx can't "
                                      "say which other units have these lots fitted. Update it (1.0.0 or later) to see them.")
     assert tracing.rw_rows(r)[1][-1] == "not in RevisionWorx's unit register"
+    # a lot that went into no unit: the register's answer stands on its own
+    nothing = {"units": [], "fitted": [], "note": ""}
+    assert tracing.rw_summary(nothing) == "RevisionWorx records it fitted in no unit."
+    spare = {"unit": _summary("unt_" + "7" * 32, "NH-77"), "position": "K1", "current": True}
+    assert tracing.rw_summary({"units": [], "fitted": [{"item": "KIT", "lot": "L", **spare}], "note": ""}) == (
+        "RevisionWorx records it, or a lot made from it, fitted in NH-77, which the stock ledger can't know.")
 
 
 def test_a_recall_asks_the_real_revisionworx_and_writes_nothing_there(workspace, plant):
