@@ -53,3 +53,88 @@ def rows(t) -> list[list[str]]:
     for key, title in SECTIONS:
         walk(title, t[key], 0)
     return out
+
+
+# ---- what RevisionWorx's unit register says of what a lot reached (read-only; docs/COMPANY_FILE.md, Tracing a lot)
+def in_revisionworx(t, client) -> dict:
+    """What RevisionWorx's unit register says of what lot trace ``t`` reached, asked through ``client`` (a
+    revisionworx.Client), writing nothing there:
+
+    - ``units``: each unit the lot went into, with ``found``, the register's summary of it (status, customer, site,
+      location), or None when the register doesn't have it. It is matched by the id RevisionWorx gave it when it was
+      registered, or by its serial.
+    - ``fitted``: units the register records one of the lots reached fitted in (the lot traced, or a lot made from it),
+      now or before, that the trace didn't reach: a spare fitted in the field, say, which the stock ledger can't know.
+      Each has ``item``, ``lot`` and the register's row (``unit``, ``position``, ``current``, ``fitted_on``,
+      ``removed_on``).
+    - ``note``: why ``fitted`` couldn't be asked, if it couldn't."""
+    summaries = client.units()
+    by_id = {u["id"]: u for u in summaries}
+    by_serial = {}
+    for u in summaries:
+        for ident in u.get("identifiers") or []:
+            if isinstance(ident, dict) and ident.get("scheme") == "serial" and not ident.get("issuer"):
+                by_serial.setdefault(str(ident.get("value", "")).casefold(), u)
+    out = {"units": [], "fitted": [], "note": ""}
+    reached = set()
+    for unit in t["units"]:
+        found = by_id.get(unit["rw_unit"]) if unit["rw_unit"] else None
+        found = found or by_serial.get(unit["serial"].casefold())
+        out["units"].append({**unit, "found": found})
+        if found:
+            reached.add(found["id"])
+    if not client.has("unit-where-used"):
+        out["note"] = ("This RevisionWorx can't say which other units have these lots fitted. Update it (1.0.0 or "
+                       "later) to see them.")
+        return out
+    seen = set()
+    for lot in t["lots"]:
+        for row in client.where_used(lot["item"], lot["lot"], history=True):
+            key = (row["unit"].get("id"), row.get("position"), row.get("fitted"))
+            if row["unit"].get("id") in reached or key in seen:
+                continue
+            seen.add(key)
+            out["fitted"].append({"item": lot["item"], "lot": lot["lot"], **row})
+    return out
+
+
+def _where(u) -> str:
+    """Where a unit is, as the register says: its customer, site and location, as far as they're known."""
+    return ", ".join(x for x in (u.get("customer", ""), u.get("site", ""), u.get("location", "")) if x) or "not recorded"
+
+
+def rw_summary(r) -> str:
+    """The register's answer in a sentence or two."""
+    n = len(r["units"])
+    found = [u for u in r["units"] if u["found"]]
+    parts = []
+    if n:
+        parts.append(f"RevisionWorx has {len(found)} of the {n} unit{'s' if n != 1 else ''} made from it"
+                     + ("" if len(found) == n else
+                        f"; not {_names(u['serial'] for u in r['units'] if not u['found'])}") + ".")
+    if r["fitted"]:
+        units = _names(dict.fromkeys(f["unit"].get("label", "?") for f in r["fitted"]))
+        parts.append(f"It also records it, or a lot made from it, fitted in {units}, which the stock ledger can't know.")
+    elif not r["note"]:
+        parts.append("It records it fitted in no other unit.")
+    if r["note"]:
+        parts.append(r["note"])
+    return " ".join(parts) or "RevisionWorx has nothing more on it."
+
+
+def rw_rows(r) -> list[list[str]]:
+    """The register's answer as rows under HEADERS, in a section of its own."""
+    section = "In RevisionWorx"
+    out = []
+    for u in r["units"]:
+        f = u["found"]
+        out.append([section, "0", "Unit", u["item"], u["serial"], "1", f["label"] if f else "", _where(f) if f else "",
+                    "", (f"{f.get('status', '')}" if f else "not in RevisionWorx's unit register")])
+    for row in r["fitted"]:
+        unit = row["unit"]
+        when = row.get("fitted_on", "") or ""
+        state = "fitted now" if row.get("current") else (f"removed {row.get('removed_on', '')}".strip()
+                                                         + (f", {row['disposition']}" if row.get("disposition") else ""))
+        out.append([section, "0", f"Fitted at {row.get('position', '')}", row["item"], row["lot"], "",
+                    unit.get("label", ""), _where(unit), when, f"{state}; {unit.get('status', '')}".strip("; ")])
+    return out

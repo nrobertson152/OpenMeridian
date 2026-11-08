@@ -98,6 +98,17 @@ A trace follows the ledger and nothing else:
   its trail. An item made that isn't tracked ends the trail, and the trace says so.
 - What's left in each lot reached is shown as in stock. A trace stops after 24 levels of assemblies and says so.
 
+With RevisionWorx connected, **Where are they now?** asks its unit register, and only reads it:
+
+- For each unit the lot went into, it says what the register has: status, customer, site and location. The unit is
+  matched by the id RevisionWorx gave it when it was registered, or else by its serial (`link units`).
+- It lists the units the register records any lot reached fitted in, now or before, that the ledger didn't reach. That
+  covers the lot traced and every lot made from it (`link where-used --part-number ITEM --lot LOT --history`, RevisionWorx's
+  `unit-where-used` feature). A spare fitted on site is the usual case: the ledger knows only that it was shipped. The item
+  number is taken as the part number.
+- Nothing is written to RevisionWorx, and nothing it says is kept in the company file. Saving the trace as CSV includes
+  the answer.
+
 ## Upgrading an older file
 
 When OpenMeridian opens a file of an older format, it takes the write lock (`BEGIN IMMEDIATE`) and then:

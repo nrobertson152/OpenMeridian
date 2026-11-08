@@ -4,6 +4,8 @@ files are upgraded when opened, with a verified copy kept first."""
 import os
 import shutil
 import sqlite3
+import subprocess
+from pathlib import Path
 
 import pytest
 from conftest import FakeRevisionWorx, M, Q
@@ -398,3 +400,95 @@ def test_a_trace_that_goes_deeper_than_it_follows_says_where_it_stopped(plant, m
                                        "to go further.")
     back = c.trace_lot(p.kit, "WO-00001")["came"][0]["children"]
     assert [(s["item"], s["children"]) for s in back if s["code"]] == [("HSE", [])]
+
+
+# ---------------------------------------------------------------- what RevisionWorx's register says of what a lot reached
+class Register:
+    """Answers as RevisionWorx's `link units` and `link where-used` do, from what it's given, and keeps what it was asked."""
+
+    def __init__(self, units, fitted=None, features=("units", "unit-where-used")):
+        self._units, self._fitted, self.features, self.asked = units, fitted or {}, set(features), []
+
+    def has(self, feature):
+        return feature in self.features
+
+    def units(self):
+        return self._units
+
+    def where_used(self, part_number, lot="", history=True):
+        self.asked.append((part_number, lot, history))
+        return self._fitted.get((part_number.casefold(), lot.casefold()), [])
+
+
+def _summary(uid, label, customer="", site="", status="in-service", serial=None):
+    return {"id": uid, "label": label, "status": status, "customer": customer, "site": site, "location": "",
+            "identifiers": [{"scheme": "serial", "value": serial or label, "issuer": ""}]}
+
+
+def _recalled(plant):
+    """Hose lot H-2611 made into kit lot WO-00001, two kits made into power units NH-1 and NH-2 (registered), one
+    shipped to Bayside."""
+    p, c = plant, plant.c
+    kits = _released(c, p.kit, "3")
+    c.complete_work_order(kits, Q("3"), lots={p.hose: [("H-2611", Q("6"))]})
+    units = _released(c, p.hpu, "2")
+    c.complete_work_order(units, Q("2"), ["NH-1", "NH-2"], lots={p.kit: [("WO-00001", Q("2"))]})
+    c.register_units(units, FakeRevisionWorx())
+    return c.trace_lot(p.hose, "H-2611"), {u["serial"]: u["rw_unit"] for u in c.units_built(units)}
+
+
+def test_a_recall_asks_revisionworx_where_each_unit_is_and_what_else_has_the_lots(plant):
+    t, ids = _recalled(plant)
+    assert t["lots"] == [{"item": "HSE", "lot": "H-2611"}, {"item": "KIT", "lot": "WO-00001"}]
+    spare = {"unit": _summary("unt_" + "7" * 32, "NH-77", "Bayside", "Port Ellis"), "position": "K1", "fitted": 4,
+             "current": True, "fitted_on": "2026-11-20", "removed": None, "serial": "", "lot": "WO-00001"}
+    again = {"unit": _summary(ids["NH-1"], "NH-1"), "position": "K1", "fitted": 2, "current": True, "lot": "WO-00001"}
+    register = Register([_summary(ids["NH-1"], "NH-1", "Acme", "Milltown"),
+                         _summary("unt_" + "2" * 32, "NH-2 (as RevisionWorx calls it)", serial="nh-2")],
+                        {("kit", "wo-00001"): [spare, again]})
+    r = tracing.in_revisionworx(t, register)
+    assert [(u["serial"], u["found"]["label"] if u["found"] else None) for u in r["units"]] == [
+        ("NH-1", "NH-1"), ("NH-2", "NH-2 (as RevisionWorx calls it)")], "by the id it was registered with, or the serial"
+    assert [(f["unit"]["label"], f["item"], f["lot"], f["position"]) for f in r["fitted"]] == [("NH-77", "KIT", "WO-00001", "K1")]
+    assert register.asked == [("HSE", "H-2611", True), ("KIT", "WO-00001", True)], "every lot reached, ever fitted"
+    assert tracing.rw_summary(r) == ("RevisionWorx has 2 of the 2 units made from it. It also records it, or a lot made "
+                                     "from it, fitted in NH-77, which the stock ledger can't know.")
+    rows = tracing.rw_rows(r)
+    assert rows[0] == ["In RevisionWorx", "0", "Unit", "HPU", "NH-1", "1", "NH-1", "Acme, Milltown", "", "in-service"]
+    assert rows[2] == ["In RevisionWorx", "0", "Fitted at K1", "KIT", "WO-00001", "", "NH-77", "Bayside, Port Ellis",
+                       "2026-11-20", "fitted now; in-service"]
+
+
+def test_a_unit_revisionworx_doesnt_have_and_an_older_revisionworx_are_said_plainly(plant):
+    t, ids = _recalled(plant)
+    old = Register([_summary(ids["NH-1"], "NH-1")], features=("units",))
+    r = tracing.in_revisionworx(t, old)
+    assert [u["found"] is None for u in r["units"]] == [False, True] and old.asked == [] and r["fitted"] == []
+    assert tracing.rw_summary(r) == ("RevisionWorx has 1 of the 2 units made from it; not NH-2. This RevisionWorx can't "
+                                     "say which other units have these lots fitted. Update it (1.0.0 or later) to see them.")
+    assert tracing.rw_rows(r)[1][-1] == "not in RevisionWorx's unit register"
+
+
+def test_a_recall_asks_the_real_revisionworx_and_writes_nothing_there(workspace, plant):
+    from openmeridian import revisionworx as rw
+    w, p, c = workspace, plant, plant.c
+    client = rw.Client(w.path)
+    kits = _released(c, p.kit, "2")
+    c.complete_work_order(kits, Q("2"), lots={p.hose: [("H-2611", Q("4"))]})
+    units = _released(c, p.hpu, "1")
+    c.complete_work_order(units, Q("1"), ["NH-26-0101"], lots={p.kit: [("WO-00001", Q("1"))]})
+    assert c.register_units(units, client)["registered"] == ["NH-26-0101"]
+
+    def unit(*args):                    # `revisionworx unit ...` takes no top-level --json
+        subprocess.run([*rw.find_cli(), "-w", w.path, "unit", *args], capture_output=True, text=True, check=True)
+    unit("update", "NH-26-0101", "--customer", "Acme", "--site", "Milltown")
+    unit("new", "--serial", "NH-26-0900", "--model", "HPU", "--customer", "Bayside Marine", "--status", "in-service")
+    unit("fit", "NH-26-0900", "K1", "--part-number", "KIT", "--lot", "WO-00001")       # a spare kit, fitted on site
+    files = {f: f.stat().st_mtime_ns for f in (Path(w.path) / ".revisionworx").rglob("*") if f.is_file()}
+    t = c.trace_lot(p.hose, "H-2611")
+    r = tracing.in_revisionworx(t, client)
+    assert [(u["serial"], u["found"]["customer"], u["found"]["site"]) for u in r["units"]] == [("NH-26-0101", "Acme", "Milltown")]
+    assert [(f["unit"]["label"], f["unit"]["customer"], f["position"], f["current"]) for f in r["fitted"]] == [
+        ("NH-26-0900", "Bayside Marine", "K1", True)]
+    assert {f: f.stat().st_mtime_ns for f in (Path(w.path) / ".revisionworx").rglob("*") if f.is_file()} == files, \
+        "asking wrote nothing in the workspace"

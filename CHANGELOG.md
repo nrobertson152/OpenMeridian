@@ -23,5 +23,9 @@ warnings and open engineering changes).
   the customers it was shipped to, what's still in stock, and where the trail stops, with **Save as CSV**. Search finds
   lots too. The sample company has a hose kit bought in lots and manifolds made in lots.
 - **Trees follow the theme** (the trace's): on dark and high-contrast themes they were white, with light text.
+- **Where are they now?** With RevisionWorx connected, a lot's trace asks its unit register, read-only, where each unit
+  made from the lot is (status, customer, site, location). It also lists units the register records the lot, or a lot
+  made from it, fitted in, which the stock ledger can't know about: a spare fitted on site, say. The answer goes into
+  the CSV. Needs RevisionWorx's `unit-where-used` feature for the second part, and says so when it isn't there.
 - **Company file format 3** adds lots. Format 2 files are upgraded when opened, with a verified copy kept beside them
   first (`NAME (format 2 backup).meridian`).

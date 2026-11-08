@@ -217,6 +217,25 @@ class Client:
             raise RevisionWorxError(str(data.get("error") or "RevisionWorx refused."), str(data.get("kind") or ""))
         return data
 
+    def has(self, feature: str) -> bool:
+        """True when this RevisionWorx announces ``feature`` (``link version``). Ask before using a newer command."""
+        if not hasattr(self, "_features"):
+            self._features = set(self._link("version").get("features") or [])
+        return feature in self._features
+
+    def units(self) -> list[dict]:
+        """Every unit in the unit register, as summaries: id, label, status, customer, site, location, identifiers."""
+        if not self.has("units"):
+            raise RevisionWorxError("This RevisionWorx has no unit register. Update it (1.0.0 or later).")
+        return [u for u in self._link("units").get("units") or [] if isinstance(u, dict) and isinstance(u.get("id"), str)]
+
+    def where_used(self, part_number: str, lot: str = "", history: bool = True) -> list[dict]:
+        """Units RevisionWorx records ``lot`` of ``part_number`` fitted in, now or (``history``) ever, each with the unit's
+        summary (``link where-used``, feature unit-where-used). Read-only."""
+        args = ["where-used", f"--part-number={part_number}"] + ([f"--lot={lot}"] if lot else [])
+        return [r for r in self._link(*args, *(["--history"] if history else [])).get("rows") or []
+                if isinstance(r, dict) and isinstance(r.get("unit"), dict)]
+
     def register_units(self, txid: str, serials: list[str], *, model: str, name: str, built: str, document: str = "",
                        evidence: str = "") -> list[tuple[str, str]]:
         """Register units a work order built in RevisionWorx's unit register, all of them or none (``link unit-register``).
