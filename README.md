@@ -71,7 +71,8 @@ OpenMeridian is deliberately small, and a simple result mustn't look like an exa
   what's fitted in it). Bought parts have lots here, not serials.
 - **A trace is only as good as what was recorded.** Lots are followed whole: if more stock was added to a lot made from
   the one traced, that is followed too, so a recall can be wider than it needs to be but not narrower. Stock moved
-  before lots were tracked on an item can't be traced.
+  before lots were tracked on an item can't be traced. A lot has no cost of its own: the item's average cost covers
+  all its lots.
 - **One person at a time.** A company file on your own disk is the supported setup. Using one over a network share has
   **not** been tested, and SQLite's locking can't be relied on over network filesystems.
 - **The logo is placeholder artwork.**

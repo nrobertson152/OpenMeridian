@@ -700,3 +700,22 @@ def test_adjusting_a_lot_and_finding_a_lot_from_search(app, qapp, tmp_path, monk
     monkeypatch.setattr(dlg, "PickDialog", Pick)
     app.global_search()
     assert ("Lot  H-9  HSE  Hose", ("items", hose)) in rows
+
+
+def test_a_trace_is_readable_on_every_theme(sample, qapp):
+    from PySide6.QtGui import QColor
+    c = sample.company
+    hose = c.item_by_number("HSE-08")["id"]
+    for name in th.THEMES:
+        sample.set_theme(name)
+        d = dlg.TraceDialog(sample, hose, "DM-26-1104")
+        d.resize(900, 420)
+        d.show()
+        pump(qapp)
+        view = d.tree.viewport()
+        image = view.grab().toImage()
+        below = image.pixelColor(view.width() - 4, view.height() - 4)      # under the last row: the tree's own background
+        surface = QColor(sample.theme.ui["surface"])
+        assert (below.red(), below.green(), below.blue()) == (surface.red(), surface.green(), surface.blue()), name
+        assert d.tree.palette().color(d.tree.foregroundRole()).name() == QColor(sample.theme.ui["text"]).name(), name
+        d.close()

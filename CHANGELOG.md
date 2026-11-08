@@ -22,5 +22,6 @@ warnings and open engineering changes).
   **Lots** tab, or a work order's lots) shows where a lot came from and where it went: the lots and units made from it,
   the customers it was shipped to, what's still in stock, and where the trail stops, with **Save as CSV**. Search finds
   lots too. The sample company has a hose kit bought in lots and manifolds made in lots.
+- **Trees follow the theme** (the trace's): on dark and high-contrast themes they were white, with light text.
 - **Company file format 3** adds lots. Format 2 files are upgraded when opened, with a verified copy kept beside them
   first (`NAME (format 2 backup).meridian`).
