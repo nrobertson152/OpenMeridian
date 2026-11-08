@@ -237,13 +237,18 @@ class Client:
                 if isinstance(r, dict) and isinstance(r.get("unit"), dict)]
 
     def register_units(self, txid: str, serials: list[str], *, model: str, name: str, built: str, document: str = "",
-                       evidence: str = "") -> list[tuple[str, str]]:
+                       evidence: str = "", lots: list[dict] | None = None) -> list[tuple[str, str]]:
         """Register units a work order built in RevisionWorx's unit register, all of them or none (``link unit-register``).
         ``txid`` is the same for every attempt at one completion, so RevisionWorx records them once however often it is
         asked. ``document`` is the revision they were built to, ``DOC@REV`` (ids). The serials are this organization's
-        (no issuer). Returns (serial, RevisionWorx unit id) pairs for the units it lists."""
-        if "unit-records" not in (self._link("version").get("features") or []):
+        (no issuer). ``lots`` are the lots the completion used, ``[{number, lot, quantity}]``: each unit records them in
+        the same entry (feature ``unit-lots``). Returns (serial, RevisionWorx unit id) pairs for the units it lists."""
+        features = self._link("version").get("features") or []
+        if "unit-records" not in features:
             raise RevisionWorxError("This RevisionWorx can't register units. Update it (1.0.0 or later).")
+        if lots and "unit-lots" not in features:
+            raise RevisionWorxError("This RevisionWorx can't record the lots the units were built from, so they weren't "
+                                    "registered. Update it (1.0.0 or later).")
         # --option=value throughout, so a value starting with "-" (a serial like -0042, say) stays a value
         args = ["unit-register", f"--txid={txid}", f"--model={model}", "--status=built", f"--built={built}"]
         args += [f"--serial={sn}" for sn in serials]
@@ -253,8 +258,15 @@ class Client:
             args.append(f"--doc={document}")
         if evidence:
             args.append(f"--evidence={evidence}")
+        with tempfile.TemporaryDirectory(prefix="openmeridian-") as d:
+            if lots:                                 # a file: a completion's lots can be longer than a command line
+                path = os.path.join(d, "lots.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(lots, f, ensure_ascii=False)
+                args.append(f"--lots-file={path}")
+            answer = self._link(*args)
         out = []
-        for u in self._link(*args).get("units") or []:
+        for u in answer.get("units") or []:
             if not isinstance(u, dict) or not isinstance(u.get("id"), str):
                 continue
             for i in u.get("identifiers") or []:

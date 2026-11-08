@@ -580,3 +580,88 @@ def test_a_recall_asks_the_real_revisionworx_and_writes_nothing_there(workspace,
         ("NH-26-0900", "Bayside Marine", "K1", True)]
     assert {f: f.stat().st_mtime_ns for f in (Path(w.path) / ".revisionworx").rglob("*") if f.is_file()} == files, \
         "asking wrote nothing in the workspace"
+
+
+# ---------------------------------------------------------------- the lots a completion used, recorded in RevisionWorx
+def test_a_completions_lots_go_with_its_units(plant):
+    """Director's decision, 2026-11-08: the units a completion built are registered with the lots it used, in the same call
+    and under the same txid. Untracked items name no lot, so they aren't sent."""
+    p, c = plant, plant.c
+    kits = _released(c, p.kit, "3")
+    c.complete_work_order(kits, Q("3"), lots={p.hose: [("H-2611", Q("6"))]})
+    units = _released(c, p.hpu, "3")
+    c.complete_work_order(units, Q("2"), ["NH-1", "NH-2"], lots={p.kit: [("WO-00001", Q("2"))]})
+    c.complete_work_order(units, Q("1"), ["NH-3"], lots={p.kit: [("WO-00001", Q("1"))]})
+    fake = FakeRevisionWorx()
+    assert c.register_units(units, fake) == {"registered": ["NH-1", "NH-2", "NH-3"], "refused": []}
+    assert [(call[1], call[2]["lots"]) for call in fake.calls] == [
+        (["NH-1", "NH-2"], [{"number": "KIT", "lot": "WO-00001", "quantity": "2 EA"}]),
+        (["NH-3"], [{"number": "KIT", "lot": "WO-00001", "quantity": "1 EA"}])]
+    c.register_units(kits, fake)                    # kits are made in lots, not as units: nothing to register
+    assert len(fake.calls) == 2
+
+
+def test_a_completion_that_used_no_lots_sends_what_it_sent_before(setup):
+    s, c = setup, setup.c
+    c.update_item(s.x, tracking="serial")
+    wo = c.create_work_order(s.x, Q("1"))
+    c.release_work_order(wo)
+    c.complete_work_order(wo, Q("1"), ["NH-1"])
+    fake = FakeRevisionWorx()
+    c.register_units(wo, fake)
+    assert "lots" not in fake.calls[0][2], "so an older registration retried with its txid is still recognised"
+
+
+def test_a_revisionworx_that_cant_record_lots_registers_nothing_and_says_so(plant, monkeypatch):
+    from openmeridian import revisionworx as rw
+    p, c = plant, plant.c
+    units = _released(c, p.hpu, "1")
+    kits = _released(c, p.kit, "1")
+    c.complete_work_order(kits, Q("1"), lots={p.hose: [("H-2611", Q("2"))]})
+    c.complete_work_order(units, Q("1"), ["NH-1"], lots={p.kit: [("WO-00002", Q("1"))]})
+    client = rw.Client.__new__(rw.Client)
+    asked = []
+
+    def link(*args):
+        asked.append(args[0])
+        if args[0] == "version":
+            return {"ok": True, "features": ["units", "unit-records", "unit-where-used"]}   # before unit-lots
+        raise AssertionError("nothing is registered without its lots")
+    monkeypatch.setattr(client, "_link", link, raising=False)
+    out = c.register_units(units, client)
+    assert out["registered"] == [] and "can't record the lots the units were built from" in out["refused"][0][1]
+    assert c.units_built(units)[0]["rw_unit"] == "" and "Update it" in c.units_built(units)[0]["rw_note"]
+    assert asked == ["version"]
+
+
+def test_a_unit_registered_as_built_from_a_lot_reads_as_such_in_the_recall(plant):
+    row = {"unit": _summary("unt_" + "8" * 32, "NH-88"), "position": "", "current": True, "fitted_on": "2026-11-08",
+           "built_from": {"units": 3, "quantity": "1 EA"}}
+    rows = tracing.rw_rows({"units": [], "fitted": [{"item": "KIT", "lot": "L", **row}], "note": ""})
+    assert rows[0][2:5] == ["Built from it", "KIT", "L"] and rows[0][9].startswith("one of 3 units built with it")
+
+
+def test_the_lots_are_recorded_in_the_real_revisionworx(workspace, plant):
+    from openmeridian import revisionworx as rw
+    w, p, c = workspace, plant, plant.c
+    client = rw.Client(w.path)
+    if not client.has("unit-lots"):
+        pytest.skip("this RevisionWorx can't record lots yet")
+    kits = _released(c, p.kit, "2")
+    c.complete_work_order(kits, Q("2"), lots={p.hose: [("H-2611", Q("4"))]})
+    units = _released(c, p.hpu, "2")
+    c.complete_work_order(units, Q("2"), ["NH-26-0101", "NH-26-0102"], lots={p.kit: [("WO-00001", Q("2"))]})
+    assert c.register_units(units, client)["registered"] == ["NH-26-0101", "NH-26-0102"]
+    for serial in ("NH-26-0101", "NH-26-0102"):
+        lots = client._link("unit", serial)["unit"]["factory_lots"]
+        assert [(x["number"], x["lot"], x["quantity"], x["units"]) for x in lots] == [("KIT", "WO-00001", "2 EA", 2)]
+    # asked again with the same txid (its answer lost on the way, say): the same units, nothing more recorded
+    before = len(client._link("unit", "NH-26-0101")["unit"]["history"])
+    made = c.units_built(units)[0]
+    again = client.register_units(c.register_txid(units, 1), ["NH-26-0101", "NH-26-0102"], model=made["model"],
+                                  name=made["name"], built=made["made"], evidence=f"work-order:{c.work_order(units)['number']}",
+                                  lots=[{"number": "KIT", "lot": "WO-00001", "quantity": "2 EA"}])
+    assert [uid for _, uid in again] == [u["rw_unit"] for u in c.units_built(units)]
+    assert len(client._link("unit", "NH-26-0101")["unit"]["history"]) == before
+    t = c.trace_lot(p.hose, "H-2611")
+    assert tracing.in_revisionworx(t, client)["fitted"] == [], "its own units aren't listed again as built from the lot"

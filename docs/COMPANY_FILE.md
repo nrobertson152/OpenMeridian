@@ -37,9 +37,9 @@ A `.meridian` file is one SQLite 3.37+ database holding one company.
 
 ### Registering in RevisionWorx (the one write)
 
-By the Director's decision (2026-11-07), OpenMeridian registers the units its own work orders build in RevisionWorx's
-unit register, and writes nothing else there. Each completion is one call to `revisionworx -w WORKSPACE link
-unit-register`, all of its units or none:
+By the Director's decisions (2026-11-07 and 2026-11-08), OpenMeridian registers the units its own work orders build in
+RevisionWorx's unit register, with the lots each completion used, and writes nothing else there. Each completion is one
+call to `revisionworx -w WORKSPACE link unit-register`, all of its units or none:
 
 | Argument | Value |
 |---|---|
@@ -49,9 +49,11 @@ unit-register`, all of its units or none:
 | `--status`, `--built` | `built`, and the day they were made |
 | `--doc` | `DOCUMENT_ID@REVISION_ID` that the work order recorded when it was released, if it recorded one |
 | `--evidence` | `work-order:` and the work order number |
+| `--lots-file` | only when the completion used lot-tracked items: a UTF-8 JSON file listing each lot the completion took from stock (`stock_moves` of kind `consume` with its `batch`), as `{"number": item number, "lot": lot, "quantity": the quantity used and the item's unit}`. RevisionWorx records them on each unit, saying how many units were built with them (its feature `unit-lots`); a RevisionWorx without that feature is told nothing, and the units stay unregistered with why |
 
 Every attempt at a completion sends exactly this, even after its item was renamed, so RevisionWorx answers a repeat
-with the units it already registered (`already-recorded`) and writes nothing. If a completion's txid was used in
+with the units it already registered (`already-recorded`) and writes nothing. (A part the completion used that is
+renumbered in between changes its lots' number, and RevisionWorx then refuses the repeat; the units it registered stand.) If a completion's txid was used in
 RevisionWorx for something else (another copy of this company file registered a different completion under the same
 work order number, say), RevisionWorx refuses (`txid-used`) and OpenMeridian says so. A refusal of any kind changes
 nothing in RevisionWorx and is kept in `rw_note`; *Register in RevisionWorx* sends the whole completion again.

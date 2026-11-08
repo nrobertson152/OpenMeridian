@@ -107,7 +107,8 @@ def in_revisionworx(t, client) -> dict:
     - ``fitted``: units the register records one of the lots reached fitted in (the lot traced, or a lot made from it),
       now or before, that the trace didn't reach: a spare fitted in the field, say, which the stock ledger can't know.
       Each has ``item``, ``lot`` and the register's row (``unit``, ``position``, ``current``, ``fitted_on``,
-      ``removed_on``).
+      ``removed_on``, and ``built_from`` for a unit registered as built from the lot). The units this company file
+      registered with their lots are among ``units`` already, so they aren't listed again.
     - ``note``: why ``fitted`` couldn't be asked, if it couldn't."""
     summaries = client.units()
     by_id = {u["id"]: u for u in summaries}
@@ -177,8 +178,13 @@ def rw_rows(r) -> list[list[str]]:
     for row in r["fitted"]:
         unit = row["unit"]
         when = row.get("fitted_on", "") or ""
-        state = "fitted now" if row.get("current") else (f"removed {row.get('removed_on', '')}".strip()
-                                                         + (f", {row['disposition']}" if row.get("disposition") else ""))
-        out.append([section, "0", f"Fitted at {row.get('position', '')}", row["item"], row["lot"], "",
-                    unit.get("label", ""), _where(unit), when, f"{state}; {unit.get('status', '')}".strip("; ")])
+        if row.get("built_from"):                    # registered as built from the lot, by whoever made that unit
+            n = row["built_from"].get("units", 1)
+            what, state = "Built from it", (f"one of {n} units built with it" if n > 1 else "built with it")
+        else:
+            what = f"Fitted at {row.get('position', '')}"
+            state = "fitted now" if row.get("current") else (f"removed {row.get('removed_on', '')}".strip()
+                                                             + (f", {row['disposition']}" if row.get("disposition") else ""))
+        out.append([section, "0", what, row["item"], row["lot"], "", unit.get("label", ""), _where(unit), when,
+                    f"{state}; {unit.get('status', '')}".strip("; ")])
     return out
