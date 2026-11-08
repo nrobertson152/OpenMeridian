@@ -30,6 +30,8 @@ def state_name(state: str) -> str:
     return STATE_NAMES.get(state, state or "no state")
 
 
+TRACKING_NAMES = {"none": "Not tracked", "serial": "By serial number. Each unit made has one",
+                  "lot": "By lot. Each receipt, use and shipment says which"}
 MOVE_KINDS = {"receipt": "Receipt", "shipment": "Shipment", "produce": "Made", "consume": "Used", "adjust": "Adjustment", "adjustment": "Adjustment"}
 ACTIONS = {"company.create": "Company created", "settings": "Settings changed", "contact.add": "Contact added", "contact.update": "Contact edited",
            "item.add": "Item added", "item.update": "Item edited", "bom.set": "BOM changed", "bom.remove": "BOM line removed", "bom.import": "BOM imported",
@@ -214,18 +216,20 @@ class ItemsPage(ListPage):
         ol.setContentsMargins(0, 8, 0, 0)
         facts = [("Cost", c.money(r["cost"])), ("Price", c.money(r["price"])), ("Reorder", f"at {fmt_qty(r['reorder_point'])}, order {fmt_qty(r['reorder_qty'])}"),
                  ("Supplier", r["supplier"] or "—"), ("Lead time", f"{r['lead_days']} days"), ("Bin", r["bin"] or "—")]
-        if r["kind"] == "make":
-            facts.append(("Serial numbers", "Each unit made has one" if r["tracking"] == "serial" else "No"))
+        facts.append(("Tracking", TRACKING_NAMES.get(r["tracking"], r["tracking"])))
         if r["notes"]:
             facts.append(("Notes", r["notes"]))
         ol.addWidget(KeyValues(facts))
         ol.addStretch(1)
         tabs.addTab(o, "Details")
+        if r["tracking"] == "lot":
+            tabs.addTab(self._lots_tab(r), "Lots")
         tabs.addTab(self._bom_tab(r), "BOM")
         tabs.addTab(self._engineering_tab(r), "Engineering")
         moves = c.moves(r["id"], 40)
         m = MiniTable(["When", "Change", "Kind", "Ref"], [(x["time"][:10], fmt_qty(x["qty"]), MOVE_KINDS.get(x["kind"], x["kind"]),
-                                                          " · ".join(t for t in (x["ref"] or x["note"], x["serial"]) if t)) for x in moves],
+                                                          " · ".join(t for t in (x["ref"] or x["note"], x["serial"],
+                                                                                 f"lot {x['lot']}" if x["lot"] else "") if t)) for x in moves],
                       right=(1,), max_rows=8)
         h = QWidget()
         hl = QVBoxLayout(h)
@@ -238,6 +242,39 @@ class ItemsPage(ListPage):
             p.section("Used in")
             p.add(MiniTable(["Item", "Description", "Qty"], [(u["number"], u["description"], fmt_qty(u["qty"])) for u in used], right=(2,),
                             on_activate=lambda i: app.go("items", used[i]["id"]), max_rows=5))
+
+    def _lots_tab(self, r):
+        """Every lot the item has had, newest first, with what's left of each; any of them can be traced."""
+        c = self.app.company
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(0, 8, 0, 0)
+        lots = list(reversed(c.lots(r["id"])))
+        if not lots:
+            l.addWidget(label("No lots yet. Each receipt, completion or adjustment that brings this item in says its lot.", "muted", wrap=True))
+            l.addStretch(1)
+            return w
+        t = MiniTable(["Lot", "On hand", "First in"], [(x["lot"], fmt_qty(x["on_hand"]), x["first"][:10]) for x in lots], right=(1,),
+                      on_activate=lambda i: self.trace(r["id"], lots[i]["lot"]), max_rows=8)
+        l.addWidget(t)
+        row = QHBoxLayout()
+        row.addWidget(button("Trace…", lambda: self._trace_selected(r, t, lots)))
+        row.addStretch(1)
+        l.addLayout(row)
+        l.addStretch(1)
+        return w
+
+    def _trace_selected(self, r, table, lots):
+        row = table.selected_row()
+        if row < 0:
+            self.app.toast("Select a lot first.")
+            return
+        self.trace(r["id"], lots[row]["lot"])
+
+    def trace(self, item_id, lot):
+        d = self.app.run_guarded(lambda: dlg.TraceDialog(self.app, item_id, lot))
+        if d is not None:
+            d.exec()
 
     def _bom_tab(self, r):
         c, app = self.app.company, self.app
@@ -489,9 +526,11 @@ class SalesPage(ListPage):
             self.app.after_change()
 
     def _ship(self, r, lines):
-        rows = [{"id": l["id"], "number": l["number"], "description": l["description"], "left": l["qty"] - l["shipped"]} for l in lines if l["qty"] > l["shipped"]]
+        c = self.app.company
+        rows = [{"id": l["id"], "item_id": l["item_id"], "number": l["number"], "description": l["description"], "left": l["qty"] - l["shipped"],
+                 "tracking": c.item(l["item_id"])["tracking"]} for l in lines if l["qty"] > l["shipped"]]
         d = dlg.QuantitiesDialog(self.app, f"Ship {r['number']}", "Stock leaves as soon as you ship. Change a quantity to ship part of a line.",
-                                 rows, lambda q: self.app.company.ship_sales_order(r["id"], q), "Ship")
+                                 rows, lambda q, lots: c.ship_sales_order(r["id"], q, lots), "Ship")
         if d.exec():
             self.app.after_change()
 
@@ -637,9 +676,14 @@ class PurchasingPage(ListPage):
             self.app.after_change()
 
     def _receive(self, r, lines):
-        rows = [{"id": l["id"], "number": l["number"], "description": l["description"], "left": l["qty"] - l["received"]} for l in lines if l["qty"] > l["received"]]
-        d = dlg.QuantitiesDialog(self.app, f"Receive {r['number']}", "Stock comes in at the order's cost. Change a quantity if only part arrived.",
-                                 rows, lambda q: self.app.company.receive_purchase_order(r["id"], q), "Receive")
+        c = self.app.company
+        rows = [{"id": l["id"], "item_id": l["item_id"], "number": l["number"], "description": l["description"], "left": l["qty"] - l["received"],
+                 "tracking": c.item(l["item_id"])["tracking"]} for l in lines if l["qty"] > l["received"]]
+        intro = "Stock comes in at the order's cost. Change a quantity if only part arrived."
+        if any(x["tracking"] == "lot" for x in rows):
+            intro += " Give each lot-tracked line the lot it came in as; a line that came in as two lots is received twice."
+        d = dlg.QuantitiesDialog(self.app, f"Receive {r['number']}", intro,
+                                 rows, lambda q, lots: c.receive_purchase_order(r["id"], q, lots), "Receive", lots_in=True)
         if d.exec():
             self.app.after_change()
 
@@ -721,6 +765,12 @@ class ProductionPage(ListPage):
             p.add(StatusBlock(app.theme, "neutral", "Cancelled"))
         p.add(KeyValues([("Made", f"{fmt_qty(r['done'])} of {fmt_qty(r['qty'])} {r['unit']}"), ("Created", r["created"]), ("Due", r["due_date"] or "—"),
                          ("Document", r["rw_number"] or "Not linked")]))
+        made_lots = app.company.work_order_lots(r["id"])
+        if made_lots:
+            p.section("Lots")
+            p.add(MiniTable(["Completion", "What", "Item", "Lot", "Qty"],
+                            [(str(x["batch"]), "Made" if x["kind"] == "produce" else "Used", x["number"], x["lot"], fmt_qty(x["qty"])) for x in made_lots],
+                            right=(4,), on_activate=lambda i: self._trace_lot(made_lots[i]), max_rows=8))
         if units:
             p.section(f"Units built ({len(units)})")
             if rw_on:
@@ -734,6 +784,9 @@ class ProductionPage(ListPage):
                             on_activate=lambda i: app.go("items", comps[i]["child_id"]), max_rows=8))
         else:
             p.add(label("This item has no bill of materials.", "muted"))
+
+    def _trace_lot(self, x):
+        self.app.pages["items"].trace(x["item_id"], x["lot"])
 
     def _release(self, r):
         app = self.app
@@ -861,7 +914,8 @@ class StockPage(ListPage):
                 Column("Description", lambda r: r["description"], stretch=True), Column("Kind", lambda r: MOVE_KINDS.get(r["kind"], r["kind"]), 90),
                 Column("Change", lambda r: fmt_qty(r["qty"]), 76, right=True, sort=qty_sort("qty")),
                 Column("Cost", lambda r: self.app.company.money(r["unit_cost"]), 80, right=True, sort=qty_sort("unit_cost")),
-                Column("Reference", lambda r: r["ref"] or r["note"], 180), Column("By", lambda r: r["user"], 80)]
+                Column("Reference", lambda r: r["ref"] or r["note"], 180), Column("Lot or serial", lambda r: r["lot"] or r["serial"], 120),
+                Column("By", lambda r: r["user"], 80)]
 
     def filters(self):
         return [("All", None), ("Receipts", "receipt"), ("Shipments", "shipment"), ("Production", "produce"), ("Consumed", "consume"), ("Adjustments", "adjust")]
@@ -871,7 +925,7 @@ class StockPage(ListPage):
         rows = self.app.company.moves(limit=3000)
         if self.filter_key:
             rows = [r for r in rows if r["kind"] == self.filter_key]
-        return [r for r in rows if t in r["number"].casefold() or t in r["description"].casefold() or t in r["ref"].casefold()]
+        return [r for r in rows if any(t in r[k].casefold() for k in ("number", "description", "ref", "lot", "serial"))]
 
     def key_of(self, row):
         return row["id"]

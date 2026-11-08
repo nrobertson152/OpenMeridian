@@ -524,6 +524,8 @@ class App:
                 rows.append((f"Go to {text}", (key, None)))
         for i in c.items():
             rows.append((f"Item  {i['number']}  {i['description']}", ("items", i["id"])))
+        for lot in c.all_lots():
+            rows.append((f"Lot  {lot['lot']}  {lot['number']}  {lot['description']}", ("items", lot["item_id"])))
         for o in c.sales_orders():
             rows.append((f"Sales order  {o['number']}  {o['customer']}  {o['reference']}", ("sales", o["id"])))
         for o in c.purchase_orders():
@@ -535,7 +537,7 @@ class App:
         for k in ("customer", "supplier"):
             for p in c.contacts(k):
                 rows.append((f"{k.capitalize()}  {p['name']}", (k + "s", p["id"])))
-        d = dlg.PickDialog(self, "Search everything", rows, "Type an item, order, customer or page")
+        d = dlg.PickDialog(self, "Search everything", rows, "Type an item, lot, order, customer or page")
         if d.exec() and d.chosen:
             self.go(d.chosen[0], d.chosen[1])
 

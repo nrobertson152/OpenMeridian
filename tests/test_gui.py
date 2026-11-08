@@ -7,7 +7,7 @@ from conftest import CSV, FakeRevisionWorx, M, Q, release
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QTabWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QTabWidget  # noqa: E402
 
 from openmeridian.company import Company  # noqa: E402
 from openmeridian.gui import dialogs as dlg  # noqa: E402
@@ -454,23 +454,35 @@ def test_without_revisionworx_units_built_are_listed_and_nothing_is_sent(app, qa
     assert "Each unit made has one" in text and f"{c.work_order(wo)['number']} · NH-7" in text
 
 
-def test_item_dialog_sets_serial_numbers_only_for_items_made(sample, qapp):
+def test_item_dialog_offers_serial_numbers_only_for_items_made_and_lots_for_any(sample, qapp):
+    def offered(dialog, tracking):
+        return dialog.tracking.model().item(dialog.tracking.findData(tracking)).isEnabled()
     d = dlg.ItemDialog(sample)
     d.number.setText("SER-1")
-    assert not d.tracking.isEnabled() and d.tracking.currentData() == "none", "a bought item has no serial numbers here"
+    assert not offered(d, "serial") and d.tracking.currentData() == "none", "a bought item has no serial numbers here"
+    assert offered(d, "lot"), "but it can be bought in lots"
     d.kind.setCurrentIndex(d.kind.findData("make"))
-    assert d.tracking.isEnabled()
+    assert offered(d, "serial") and offered(d, "lot")
     d.tracking.setCurrentIndex(d.tracking.findData("serial"))
     d.submit()
     item = sample.company.item_by_number("SER-1")
     assert item["tracking"] == "serial" and item["kind"] == "make"
     # made into a bought item, it stops having them (allowed while none is in stock)
     e = dlg.ItemDialog(sample, item)
-    assert e.tracking.isEnabled() and e.tracking.currentData() == "serial"
+    assert offered(e, "serial") and e.tracking.currentData() == "serial"
     e.kind.setCurrentIndex(e.kind.findData("buy"))
-    assert e.tracking.currentData() == "none" and not e.tracking.isEnabled()
+    assert e.tracking.currentData() == "none" and not offered(e, "serial")
     e.submit()
     assert sample.company.item_by_number("SER-1")["tracking"] == "none"
+    # lots stay chosen whichever way the item goes
+    g = dlg.ItemDialog(sample)
+    g.number.setText("LOT-1")
+    g.tracking.setCurrentIndex(g.tracking.findData("lot"))
+    g.kind.setCurrentIndex(g.kind.findData("make"))
+    g.kind.setCurrentIndex(g.kind.findData("buy"))
+    assert g.tracking.currentData() == "lot"
+    g.submit()
+    assert sample.company.item_by_number("LOT-1")["tracking"] == "lot"
     # the rule is the company's, whatever the window shows
     f = dlg.ItemDialog(sample)
     f.number.setText("SER-2")
@@ -516,3 +528,175 @@ def test_units_made_are_registered_in_the_real_revisionworx_through_the_window(a
     assert [d["revision"]["id"] for d in got["documents"]] == [w.rev]
     text, buttons = _panel_text(page)
     assert text.count("Registered") == 2 and "Register in RevisionWorx" not in buttons
+
+
+# ---------------------------------------------------------------- lots through the window
+def _lot_company(app, tmp_path):
+    p = str(tmp_path / "lots.meridian")
+    Company.create(p, "Lot Works").close()
+    assert app.open_path(p)
+    c = app.company
+    sup = c.add_contact("supplier", "Hose Co")
+    cus = c.add_contact("customer", "Bayside")
+    hose = c.add_item("HSE", "Hose", "buy", cost=M("5"), tracking="lot")
+    kit = c.add_item("KIT", "Hose kit", "make", price=M("40"), tracking="lot")
+    c.set_bom_line(kit, hose, Q("2"))
+    po = c.create_purchase_order(sup)
+    line = c.add_purchase_line(po, hose, Q("10"), M("5"))
+    c.place_purchase_order(po)
+    return c, sup, cus, hose, kit, po, line
+
+
+def test_receiving_completing_and_shipping_say_which_lots_through_the_window(app, qapp, tmp_path, monkeypatch):
+    c, _sup, cus, hose, kit, po, line = _lot_company(app, tmp_path)
+    page = app.pages["purchasing"]
+    app.go("purchasing", po)
+    pump(qapp)
+    assert page.panel.primary_button.text() == "Receive…"
+
+    def receive(lot, qty):
+        def run(self):
+            assert self.table.horizontalHeaderItem(4).text() == "Lot"
+            assert self.lot_edits[line].placeholderText() == "Supplier's lot"
+            if lot == "H-1":
+                self.submit()                       # no lot given: refused, nothing received
+                assert "say which lot it came in as" in self.message.text() and c.lots(hose) == []
+            self.table.item(self.line_row[line], 3).setText(qty)
+            self.lot_edits[line].setText(lot)
+            self.submit()
+            return self.result()
+        return run
+    monkeypatch.setattr(dlg.QuantitiesDialog, "exec", receive("H-1", "6"))
+    page.panel.primary_button.click()
+    pump(qapp)
+    monkeypatch.setattr(dlg.QuantitiesDialog, "exec", receive("H-2", "4"))
+    page.panel.primary_button.click()
+    pump(qapp)
+    assert [(x["lot"], x["on_hand"]) for x in c.lots(hose)] == [("H-1", Q("6")), ("H-2", Q("4"))]
+    assert c.purchase_order(po)["status"] == "received"
+
+    wo = c.create_work_order(kit, Q("3"))
+    c.release_work_order(wo)
+    page = app.pages["production"]
+    app.go("production", wo)
+    pump(qapp)
+
+    def complete(self):
+        assert self.made_lot.text() == "WO-00001"
+        used = {lot: self.lots.item(r, 3).text() for r, _cid, lot in self.lot_rows}
+        assert used == {"H-1": "6", "H-2": "0"}, "filled in oldest first for 3 kits"
+        self.qty.setText("2")
+        used = {lot: self.lots.item(r, 3).text() for r, _cid, lot in self.lot_rows}
+        assert used == {"H-1": "4", "H-2": "0"}, "and again for 2"
+        for r, _cid, lot in self.lot_rows:          # what actually went in
+            self.lots.item(r, 3).setText({"H-1": "1", "H-2": "3"}[lot])
+        self.submit()
+        return self.result()
+    monkeypatch.setattr(dlg.CompleteDialog, "exec", complete)
+    page.panel.primary_button.click()
+    pump(qapp)
+    assert {x["lot"]: x["on_hand"] for x in c.lots(hose)} == {"H-1": Q("5"), "H-2": Q("1")}
+    assert [(x["lot"], x["on_hand"]) for x in c.lots(kit)] == [("WO-00001", Q("2"))]
+    text, _buttons = _panel_text(page)
+    assert "LOTS" in text and "H-2" in text and "WO-00001" in text
+
+    so = c.create_sales_order(cus)
+    sl = c.add_sales_line(so, kit, Q("2"))
+    c.confirm_sales_order(so)
+    page = app.pages["sales"]
+    app.go("sales", so)
+    pump(qapp)
+
+    def ship(self):
+        (r, lot), = self.lot_rows[sl]
+        assert lot == "WO-00001" and self.table.item(r, 3).text() == "2"
+        self.table.item(r, 3).setText("1")
+        assert self.table.item(self.line_row[sl], 3).text() == "1", "the line ships what its lots add up to"
+        self.submit()
+        return self.result()
+    monkeypatch.setattr(dlg.QuantitiesDialog, "exec", ship)
+    page.panel.primary_button.click()
+    pump(qapp)
+    assert c.sales_lines(so)[0]["shipped"] == Q("1") and c.lot_on_hand(kit, "WO-00001") == Q("1")
+    # the stock ledger shows each move's lot, and finds a lot's moves by it
+    ledger = app.pages["stock"]
+    app.go("stock")
+    ledger.search.setText("h-2")
+    pump(qapp)
+    shown = [ledger.model.rows[i] for i in range(len(ledger.model.rows))]
+    assert sorted((m["kind"], m["qty"]) for m in shown) == [("consume", -Q("3")), ("receipt", Q("4"))]
+    assert "Lot or serial" in [col.title for col in ledger.model.columns]
+    assert not app.errors
+
+
+def test_a_lot_is_traced_from_the_item_page_and_saved_as_csv(app, qapp, tmp_path, monkeypatch):
+    c, _sup, cus, hose, kit, po, line = _lot_company(app, tmp_path)
+    c.receive_purchase_order(po, None, {line: "H-1"})
+    wo = c.create_work_order(kit, Q("2"))
+    c.release_work_order(wo)
+    c.complete_work_order(wo, lots={hose: [("H-1", Q("4"))]})
+    so = c.create_sales_order(cus)
+    sl = c.add_sales_line(so, kit, Q("1"))
+    c.confirm_sales_order(so)
+    c.ship_sales_order(so, None, {sl: [("WO-00001", Q("1"))]})
+    page = app.pages["items"]
+    app.go("items", hose)
+    pump(qapp)
+    tabs = page.panel.inner.findChild(QTabWidget)
+    assert [tabs.tabText(i) for i in range(tabs.count())][:2] == ["Details", "Lots"]
+    text, buttons = _panel_text(page)
+    assert "By lot. Each receipt, use and shipment says which" in text and "Trace…" in buttons and "lot H-1" in text
+    seen = {}
+
+    def show(self):
+        seen["summary"] = " ".join(x.text() for x in self.findChildren(QLabel))
+        top = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        seen["sections"] = [t.text(0) for t in top]
+        went = top[1]
+        seen["went"] = [went.child(i).text(0) for i in range(went.childCount())]
+        seen["made"] = went.child(0).child(0).text(1), went.child(0).child(0).text(2)
+        self.save_csv(str(tmp_path / "trace.csv"))
+        return 0
+    monkeypatch.setattr(dlg.TraceDialog, "exec", show)
+    page.trace(hose, "h-1")
+    assert seen["sections"] == ["Where it came from", "Where it went"]
+    assert seen["went"] == ["Used", "In stock"] and seen["made"] == ("KIT", "WO-00001")
+    assert "1 shipment carried it or what was made from it, to Bayside" in seen["summary"]
+    csv_text = (tmp_path / "trace.csv").read_text(encoding="utf-8-sig")
+    assert csv_text.splitlines()[0] == "Section,Level,What,Item,Lot or serial,Qty,Reference,Customer or supplier,Date,Note"
+    assert "Where it went,2,Shipped,KIT,WO-00001,1,SO-00001,Bayside" in csv_text
+    page.trace(hose, "NO-SUCH")                     # a refusal is a message, never a crash
+    assert app.errors and "HSE has no lot NO-SUCH" in app.errors[-1]
+
+
+def test_adjusting_a_lot_and_finding_a_lot_from_search(app, qapp, tmp_path, monkeypatch):
+    c, _sup, _cus, hose, _kit, po, line = _lot_company(app, tmp_path)
+    c.receive_purchase_order(po, None, {line: "H-1"})
+    d = dlg.AdjustDialog(app, c.item(hose))
+    assert [d.lot.itemText(i) for i in range(d.lot.count())] == ["H-1"]
+    assert d.lot.currentText() == "", "no lot is chosen for the person"
+    d.delta.setText("-1")
+    d.note.setText("count")
+    d.submit()
+    assert "say which lot is being adjusted" in d.message.text()
+    d.lot.setCurrentText("H-9")
+    d.delta.setText("-1")
+    d.note.setText("count")
+    d.submit()
+    assert "H-9 has 0 on hand" in d.message.text()
+    d.delta.setText("2")
+    d.note.setText("found, labelled H-9")
+    d.submit()
+    assert c.lot_on_hand(hose, "H-9") == Q("2")
+    rows = []
+
+    class Pick:
+        def __init__(self, _app, _title, found, _placeholder=""):
+            rows.extend(found)
+            self.chosen = None
+
+        def exec(self):
+            return 0
+    monkeypatch.setattr(dlg, "PickDialog", Pick)
+    app.global_search()
+    assert ("Lot  H-9  HSE  Hose", ("items", hose)) in rows

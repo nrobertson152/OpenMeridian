@@ -59,9 +59,13 @@ def _date(text, what="date") -> str:
 
 
 KINDS = ("buy", "make")
-TRACKING = ("none", "serial")          # "lot" is reserved in the file (format 2) for a later version
+TRACKING = ("none", "serial", "lot")
 REGISTER_DOMAIN = "openmeridian/register/v1"
 SERIAL_LIMIT, NAME_LIMIT = 100, 200    # RevisionWorx's limits for a unit's serial and name (its docs/UNITS.md)
+LOT_LIMIT = 100
+TRACE_DEPTH = 24                       # deeper than any bill of materials here; a trace stops there and says so
+UNFOLLOWED = {"none": "not tracked by lot or serial, so it can't be followed further",
+              "serial": "which units isn't recorded when they're used, so they can't be followed further"}
 MISSING_NOTE = ("RevisionWorx recorded this completion but didn't list this unit yet: it finishes recording it when its "
                 "workspace is next opened for writing. Register again to pick it up.")
 DEFAULT_SETTINGS = {"company_name": "", "currency": "$", "tax_percent": "0", "address": "", "rw_workspace": ""}
@@ -226,10 +230,8 @@ class Company:
 
     @staticmethod
     def _check_tracking(kind, tracking) -> None:
-        if tracking == "lot":
-            raise ERPError("Tracking by lot isn't available in this version of OpenMeridian.")
         if tracking not in TRACKING:
-            raise ERPError("An item is tracked by serial number, or not tracked.")
+            raise ERPError("An item is tracked by serial number, by lot, or not at all.")
         if tracking == "serial" and kind != "make":
             raise ERPError("Serial numbers are given to items you make (a unit a work order builds).")
 
@@ -246,7 +248,7 @@ class Company:
                     self._check_tracking(kind, tracking)
                     if tracking != now["tracking"] and now["on_hand"] != 0:
                         raise ERPError(f"{now['number']} has {fmt_qty(now['on_hand'])} on hand. Its stock has to be zero "
-                                       "before it starts or stops having serial numbers.")
+                                       "before it starts or stops being tracked by serial number or lot.")
                 for k, v in f.items():
                     self.conn.execute(f"UPDATE items SET {k} = ? WHERE id = ?", (v, item_id))  # noqa: S608 - k is from ITEM_FIELDS
                 self._log("item.update", str(item_id))
@@ -330,11 +332,12 @@ class Company:
         return total
 
     # ---- stock
-    def _move(self, item_id, qty, kind, ref="", note="", unit_cost=0, serial="") -> None:
-        self.conn.execute("INSERT INTO stock_moves (time, item_id, qty, unit_cost, kind, ref, note, user, serial) "
-                          "VALUES (?,?,?,?,?,?,?,?,?)", (_now(), item_id, qty, unit_cost, kind, ref, note, self.user, serial))
+    def _move(self, item_id, qty, kind, ref="", note="", unit_cost=0, serial="", lot="", batch=0) -> None:
+        self.conn.execute("INSERT INTO stock_moves (time, item_id, qty, unit_cost, kind, ref, note, user, serial, lot, batch) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                          (_now(), item_id, qty, unit_cost, kind, ref, note, self.user, serial, lot, batch))
 
-    def _add_at_cost(self, item, qty, unit_cost, kind, ref, note="", serial="") -> None:
+    def _add_at_cost(self, item, qty, unit_cost, kind, ref, note="", serial="", lot="", batch=0) -> None:
         """Bring stock in at a cost, keeping a moving average so the stock value stays true."""
         have = self.on_hand(item["id"])
         if have > 0 and item["cost"] > 0:
@@ -342,9 +345,11 @@ class Company:
         else:
             avg = unit_cost
         self.conn.execute("UPDATE items SET cost = ? WHERE id = ?", (avg, item["id"]))
-        self._move(item["id"], qty, kind, ref, note, unit_cost, serial)
+        self._move(item["id"], qty, kind, ref, note, unit_cost, serial, lot, batch)
 
-    def adjust_stock(self, item_id, delta, note, unit_cost=None) -> None:
+    def adjust_stock(self, item_id, delta, note, unit_cost=None, lot="") -> None:
+        """Change the stock by ``delta`` for a reason that goes in the ledger. An item tracked by lot says which lot: one
+        already there, or a new one when stock goes up."""
         if not _clean(note):
             raise ERPError("Say why the stock is being adjusted; the reason goes in the ledger.")
         if delta == 0:
@@ -353,11 +358,97 @@ class Company:
             item = self.item(item_id)
             if item["on_hand"] + delta < 0:
                 raise ERPError(f"{item['number']} has {fmt_qty(item['on_hand'])} on hand, so it can't go down by {fmt_qty(-delta)}.")
+            if item["tracking"] == "lot":
+                if not _clean(lot):
+                    raise ERPError(f"{item['number']} is tracked by lot: say which lot is being adjusted.")
+                lot = self._lot(item, lot)
+                have = self.lot_on_hand(item_id, lot)
+                if have + delta < 0:
+                    raise ERPError(f"{item['number']} lot {lot} has {fmt_qty(have)} on hand, so it can't go down by {fmt_qty(-delta)}.")
+            elif _clean(lot):
+                raise ERPError(f"{item['number']} isn't tracked by lot.")
             if delta > 0:
-                self._add_at_cost(item, delta, item["cost"] if unit_cost is None else unit_cost, "adjust", "", _clean(note))
+                self._add_at_cost(item, delta, item["cost"] if unit_cost is None else unit_cost, "adjust", "", _clean(note), lot=lot)
             else:
-                self._move(item_id, delta, "adjust", "", _clean(note), item["cost"])
-            self._log("stock.adjust", f"{item['number']} {fmt_qty(delta)}: {note}")
+                self._move(item_id, delta, "adjust", "", _clean(note), item["cost"], lot=lot)
+            self._log("stock.adjust", f"{item['number']} {fmt_qty(delta)}" + (f" lot {lot}" if lot else "") + f": {note}")
+
+    # ---- lots
+    def _lot(self, item, lot) -> str:
+        """``lot`` of ``item`` as the file keeps it: composed (NFC), single-spaced, without control characters, and spelt
+        as that item's lot already is if it has one ignoring ASCII case, so one lot is never two."""
+        text = unicodedata.normalize("NFC", _clean(lot))
+        if not text:
+            raise ERPError(f"{item['number']} is tracked by lot: say which lot.")
+        if len(text) > LOT_LIMIT:
+            raise ERPError(f"{text[:20]}… is longer than a lot can be ({LOT_LIMIT} characters).")
+        if any(unicodedata.category(ch) == "Cc" for ch in text):
+            raise ERPError(f"{text!r} has a control character in it, which a lot can't have.")
+        had = self.conn.execute("SELECT lot FROM stock_moves WHERE item_id = ? AND lot = ? COLLATE NOCASE ORDER BY id LIMIT 1",
+                                (item["id"], text)).fetchone()
+        return had[0] if had else text
+
+    def lots(self, item_id, in_stock=False) -> list[dict]:
+        """An item's lots, oldest first: each with what is on hand in it and when it first came in. ``in_stock`` leaves
+        out the lots that are used up."""
+        rows = self._rows("SELECT lot, SUM(qty) AS on_hand, MIN(time) AS first, MIN(id) AS first_id FROM stock_moves "
+                          "WHERE item_id = ? AND lot <> '' GROUP BY lot ORDER BY first_id", item_id)
+        return [r for r in rows if r["on_hand"] > 0] if in_stock else rows
+
+    def all_lots(self) -> list[dict]:
+        """Every lot of every item: item_id, number, description, lot and on_hand, by item and then oldest first."""
+        return self._rows("SELECT m.item_id, i.number, i.description, m.lot, SUM(m.qty) AS on_hand FROM stock_moves m "
+                          "JOIN items i ON i.id = m.item_id WHERE m.lot <> '' GROUP BY m.item_id, m.lot "
+                          "ORDER BY i.number COLLATE NOCASE, MIN(m.id)")
+
+    def lot_on_hand(self, item_id, lot) -> int:
+        return self.conn.execute("SELECT COALESCE(SUM(qty), 0) FROM stock_moves WHERE item_id = ? AND lot = ?",
+                                 (item_id, lot)).fetchone()[0]
+
+    def suggest_lots(self, item_id, qty) -> list[tuple[str, int]]:
+        """The lots ``qty`` would come from if the oldest goes first, as far as the lots in stock cover it. A suggestion
+        for someone to check: what is recorded is only ever the lots they say."""
+        out, left = [], qty
+        for lot in self.lots(item_id, in_stock=True):
+            if left <= 0:
+                break
+            take = min(left, lot["on_hand"])
+            out.append((lot["lot"], take))
+            left -= take
+        return out
+
+    def _picks(self, item, qty, picks, verb) -> list[tuple[str, int]]:
+        """The lots ``qty`` of ``item`` is taken from: ``picks`` is [(lot, qty)], adding up to ``qty``, each lot having
+        that much. Nothing for an item that isn't tracked by lot. ``verb`` says what the stock is doing, for messages."""
+        if item["tracking"] != "lot":
+            if any(q for _lot, q in (picks or [])):
+                raise ERPError(f"{item['number']} isn't tracked by lot.")
+            return []
+        merged: dict[str, int] = {}
+        for lot, q in picks or []:
+            if q == 0:
+                continue
+            if q < 0:
+                raise ERPError(f"{item['number']}: a quantity from a lot can't be negative.")
+            key = self._lot(item, lot)
+            merged[key] = merged.get(key, 0) + q
+        total = sum(merged.values())
+        if total != qty:
+            raise ERPError(f"{item['number']} is tracked by lot: say which lots the {fmt_qty(qty)} {verb} came from "
+                           f"({fmt_qty(total)} given).")
+        for lot, q in merged.items():
+            have = self.lot_on_hand(item["id"], lot)
+            if q > have:
+                raise ERPError(f"{item['number']} lot {lot} has {fmt_qty(have)} on hand, not {fmt_qty(q)}." if have
+                               else f"{item['number']} has no lot {lot} in stock.")
+        return list(merged.items())
+
+    def _take(self, item, qty, picks, kind, ref, unit_cost, verb, batch=0) -> list[tuple[str, int]]:
+        """Take ``qty`` of ``item`` out of stock: one move, or one per lot for an item tracked by lot."""
+        chosen = self._picks(item, qty, picks, verb)
+        for lot, q in chosen or [("", qty)]:
+            self._move(item["id"], -q, kind, ref, unit_cost=unit_cost, lot=lot, batch=batch)
+        return chosen
 
     def moves(self, item_id=None, limit=500):
         where, args = ("WHERE m.item_id = ?", [item_id]) if item_id else ("", [])
@@ -434,14 +525,18 @@ class Company:
             self.conn.execute("UPDATE sales_orders SET status = 'confirmed' WHERE id = ?", (oid,))
             self._log("so.confirm", o["number"])
 
-    def ship_sales_order(self, oid, quantities: dict | None = None) -> None:
-        """Ship {line id: qty}, or everything still to ship. Stock can't go negative: it would be a false record."""
+    def ship_sales_order(self, oid, quantities: dict | None = None, lots: dict | None = None) -> None:
+        """Ship {line id: qty}, or everything still to ship. Stock can't go negative: it would be a false record. A line
+        of an item tracked by lot says which lots it ships from: ``lots`` is {line id: [(lot, qty)]}."""
+        lots = lots or {}
         with self.tx():
             o = self._so(oid, "confirmed")
             lines = self.sales_lines(oid)
             todo = {l["id"]: l["qty"] - l["shipped"] for l in lines} if quantities is None else quantities
-            any_shipped = False
+            any_shipped, shipped_lots = False, []
             by_id = {l["id"]: l for l in lines}
+            if set(lots) - set(by_id):
+                raise ERPError("That line isn't on this order.")
             for line_id, q in todo.items():
                 if q == 0:
                     continue
@@ -454,7 +549,8 @@ class Company:
                 if q > have:
                     raise ERPError(f"{line['number']}: {fmt_qty(have)} on hand, not enough to ship {fmt_qty(q)}. Nothing was shipped.")
                 item = self.item(line["item_id"])
-                self._move(line["item_id"], -q, "shipment", o["number"], unit_cost=item["cost"])
+                taken = self._take(item, q, lots.get(line_id), "shipment", o["number"], item["cost"], "shipped")
+                shipped_lots += [f"{item['number']} lot {lot}" for lot, _q in taken]
                 self.conn.execute("UPDATE sales_lines SET shipped = shipped + ? WHERE id = ?", (q, line_id))
                 any_shipped = True
             if not any_shipped:
@@ -462,7 +558,7 @@ class Company:
             left = self.conn.execute("SELECT COALESCE(SUM(qty - shipped), 0) FROM sales_lines WHERE order_id = ?", (oid,)).fetchone()[0]
             if left == 0:
                 self.conn.execute("UPDATE sales_orders SET status = 'shipped' WHERE id = ?", (oid,))
-            self._log("so.ship", o["number"])
+            self._log("so.ship", o["number"] + (f": {', '.join(shipped_lots)}" if shipped_lots else ""))
 
     def cancel_sales_order(self, oid) -> None:
         with self.tx():
@@ -593,13 +689,19 @@ class Company:
             self.conn.execute("UPDATE purchase_orders SET status = 'ordered' WHERE id = ?", (oid,))
             self._log("po.place", o["number"])
 
-    def receive_purchase_order(self, oid, quantities: dict | None = None) -> None:
+    def receive_purchase_order(self, oid, quantities: dict | None = None, lots: dict | None = None) -> None:
+        """Receive {line id: qty}, or everything outstanding. A line of an item tracked by lot says the lot it came in as
+        (the supplier's lot or batch number): ``lots`` is {line id: lot}. A line that came in as two lots is received
+        twice, once for each."""
+        lots = lots or {}
         with self.tx():
             o = self._po(oid, "ordered")
             lines = self.purchase_lines(oid)
             by_id = {l["id"]: l for l in lines}
+            if set(lots) - set(by_id):
+                raise ERPError("That line isn't on this order.")
             todo = {l["id"]: l["qty"] - l["received"] for l in lines} if quantities is None else quantities
-            any_received = False
+            any_received, received_lots = False, []
             for line_id, q in todo.items():
                 if q == 0:
                     continue
@@ -608,7 +710,17 @@ class Company:
                     raise ERPError("That line isn't on this order.")
                 if q < 0 or q > line["qty"] - line["received"]:
                     raise ERPError(f"{line['number']}: can't receive {fmt_qty(q)}; {fmt_qty(line['qty'] - line['received'])} is outstanding.")
-                self._add_at_cost(self.item(line["item_id"]), q, line["unit_cost"], "receipt", o["number"])
+                item = self.item(line["item_id"])
+                lot = ""
+                if item["tracking"] == "lot":
+                    if not _clean(lots.get(line_id)):
+                        raise ERPError(f"{item['number']} is tracked by lot: say which lot it came in as (the supplier's lot "
+                                       "or batch number). Nothing was received.")
+                    lot = self._lot(item, lots[line_id])
+                    received_lots.append(f"{item['number']} lot {lot}")
+                elif _clean(lots.get(line_id)):
+                    raise ERPError(f"{item['number']} isn't tracked by lot.")
+                self._add_at_cost(item, q, line["unit_cost"], "receipt", o["number"], lot=lot)
                 self.conn.execute("UPDATE purchase_lines SET received = received + ? WHERE id = ?", (q, line_id))
                 any_received = True
             if not any_received:
@@ -616,7 +728,7 @@ class Company:
             left = self.conn.execute("SELECT COALESCE(SUM(qty - received), 0) FROM purchase_lines WHERE order_id = ?", (oid,)).fetchone()[0]
             if left == 0:
                 self.conn.execute("UPDATE purchase_orders SET status = 'received' WHERE id = ?", (oid,))
-            self._log("po.receive", o["number"])
+            self._log("po.receive", o["number"] + (f": {', '.join(received_lots)}" if received_lots else ""))
 
     def cancel_purchase_order(self, oid) -> None:
         with self.tx():
@@ -672,10 +784,31 @@ class Company:
                               (rw_document, rw_revision, rw_label, rw_note, wid))
             self._log("wo.release", f"{w['number']}" + (f" to Rev {rw_label}" if rw_label else ""))
 
-    def complete_work_order(self, wid, qty=None, serials=None) -> None:
+    def _next_batch(self, w) -> int:
+        """The number the next completion of work order ``w`` gets, counting from 1 (``stock_moves.batch``,
+        ``wo_units.batch``)."""
+        return 1 + self.conn.execute(
+            "SELECT MAX(COALESCE((SELECT MAX(batch) FROM wo_units WHERE work_order_id = ?), 0), "
+            "COALESCE((SELECT MAX(batch) FROM stock_moves WHERE ref = ? AND kind IN ('consume', 'produce')), 0))",
+            (w["id"], w["number"])).fetchone()[0]
+
+    def default_made_lot(self, wid) -> str:
+        """The lot an item tracked by lot comes into stock as when its work order is completed, unless someone names
+        another: the work order's number, then the number and the completion for later ones (WO-00012-2)."""
+        w = self.work_order(wid)
+        batch = self._next_batch(w)
+        return w["number"] if batch == 1 else f"{w['number']}-{batch}"
+
+    def complete_work_order(self, wid, qty=None, serials=None, lots=None, made_lot=None) -> None:
         """Consume components from stock and bring finished goods in at their actual cost. An item made with serial numbers
         needs one serial per unit made (``serials``): each unit comes into stock under its serial and is listed on the work
-        order (``units_built``), ready to be registered in RevisionWorx."""
+        order (``units_built``), ready to be registered in RevisionWorx.
+
+        A component tracked by lot says which lots were used: ``lots`` is {component item id: [(lot, qty)]}, as someone
+        says it was (``suggest_lots`` fills in a guess for them to check, never this). An item made that is tracked by
+        lot comes in as ``made_lot``, or ``default_made_lot``. Every move of the completion carries its number, so what
+        went into which units and lots can be traced."""
+        lots = dict(lots or {})
         with self.tx():
             w = self.work_order(wid)
             if w is None or w["status"] != "released":
@@ -686,29 +819,38 @@ class Company:
                 raise ERPError(f"{fmt_qty(left)} is left to make on {w['number']}.")
             item = self.item(w["item_id"])
             serials = self._check_serials(item, q, serials)
+            bom = self.bom(w["item_id"])
+            if set(lots) - {b["child_id"] for b in bom}:
+                raise ERPError(f"Lots were given for an item that isn't one of {item['number']}'s components.")
+            batch = self._next_batch(w)
+            made = ""
+            if item["tracking"] == "lot":
+                made = self._lot(item, made_lot if _clean(made_lot) else self.default_made_lot(wid))
+            elif _clean(made_lot):
+                raise ERPError(f"{item['number']} isn't tracked by lot.")
             cost = 0
-            for b in self.bom(w["item_id"]):
-                use = (q * b["qty"] + QTY_SCALE - 1) // QTY_SCALE
+            for b in self.work_order_uses(wid, q):
+                use = b["use"]
                 have = self.on_hand(b["child_id"])
                 if use > have:
                     raise ERPError(f"{b['number']}: {fmt_qty(have)} on hand, {fmt_qty(use)} needed. Nothing was consumed.")
-                self._move(b["child_id"], -use, "consume", w["number"], unit_cost=b["cost"])
+                self._take(self.item(b["child_id"]), use, lots.get(b["child_id"]), "consume", w["number"], b["cost"], "used",
+                           batch)
                 cost += line_total(use, b["cost"])
             unit = (cost * QTY_SCALE + q // 2) // q
             if serials:
-                batch = 1 + self.conn.execute("SELECT COALESCE(MAX(batch), 0) FROM wo_units WHERE work_order_id = ?",
-                                              (wid,)).fetchone()[0]
                 for sn in serials:
-                    self._add_at_cost(self.item(w["item_id"]), QTY_SCALE, unit, "produce", w["number"], serial=sn)
+                    self._add_at_cost(self.item(w["item_id"]), QTY_SCALE, unit, "produce", w["number"], serial=sn, batch=batch)
                     self.conn.execute("INSERT INTO wo_units (work_order_id, item_id, serial, batch, made, model, name) "
                                       "VALUES (?,?,?,?,?,?,?)", (wid, w["item_id"], sn, batch, today(), item["number"],
                                                                  _short(item["description"], NAME_LIMIT)))
             else:
-                self._add_at_cost(self.item(w["item_id"]), q, unit, "produce", w["number"])
+                self._add_at_cost(self.item(w["item_id"]), q, unit, "produce", w["number"], lot=made, batch=batch)
             done = w["done"] + q
             status = "complete" if done >= w["qty"] else "released"
             self.conn.execute("UPDATE work_orders SET done = ?, status = ? WHERE id = ?", (done, status, wid))
-            self._log("wo.complete", f"{w['number']}, {fmt_qty(q)} made" + (f": {', '.join(serials)}" if serials else ""))
+            self._log("wo.complete", f"{w['number']}, {fmt_qty(q)} made" + (f": {', '.join(serials)}" if serials else "")
+                      + (f" as lot {made}" if made else ""))
 
     def _check_serials(self, item, q, serials) -> list[str]:
         """The serials for ``q`` units of ``item``: one each, none repeated, none already made. None for an item without."""
@@ -818,6 +960,153 @@ class Company:
                 raise ERPError(f"{w['number']} has finished quantities, so it can't be cancelled.")
             self.conn.execute("UPDATE work_orders SET status = 'cancelled' WHERE id = ?", (wid,))
             self._log("wo.cancel", w["number"])
+
+    def work_order_uses(self, wid, qty) -> list[dict]:
+        """What completing ``qty`` of a work order takes from stock: each BOM line with ``use``, rounded up as
+        ``complete_work_order`` rounds it."""
+        w = self.work_order(wid)
+        return [{**b, "use": (qty * b["qty"] + QTY_SCALE - 1) // QTY_SCALE} for b in self.bom(w["item_id"])]
+
+    def work_order_lots(self, wid) -> list[dict]:
+        """The lots a work order used and made, completion by completion: batch, kind ('consume' or 'produce'), item_id,
+        number, lot and quantity (positive)."""
+        w = self.work_order(wid)
+        return self._rows("SELECT m.batch, m.kind, m.item_id, i.number, m.lot, SUM(ABS(m.qty)) AS qty FROM stock_moves m "
+                          "JOIN items i ON i.id = m.item_id WHERE m.ref = ? AND m.kind IN ('consume', 'produce') AND m.lot <> '' "
+                          "GROUP BY m.batch, m.kind, m.item_id, m.lot ORDER BY m.batch, m.kind, MIN(m.id)", w["number"])
+
+    # ---- tracing a lot (docs/COMPANY_FILE.md, format 3)
+    def trace_lot(self, item_id, lot) -> dict:
+        """Where a lot came from and where it went, as far as the ledger follows it.
+
+        ``came`` and ``went`` are trees of steps: {kind, what, item, code (lot or serial), qty, ref, who, date, note,
+        children}. A lot used on a work order leads to what that completion made: lots made are followed in turn (the
+        whole lot, so a lot others were added to is followed with them, which can only widen a recall), units made are
+        listed by serial, and an item made that isn't tracked ends the trail, saying so. A lot that came from a work
+        order shows what that completion used. ``units``, ``shipments``, ``in_stock`` and ``untracked`` gather what the
+        lot reached, for a recall."""
+        item = self.item(item_id)
+        if item is None:
+            raise ERPError("No such item.")
+        moves = self._lot_moves(item_id, lot)
+        if not moves:
+            raise ERPError(f"{item['number']} has no lot {lot}.")
+        lot = moves[0]["lot"]
+        out = {"item": item["number"], "description": item["description"], "unit": item["unit"], "lot": lot,
+               "on_hand": sum(m["qty"] for m in moves), "units": [], "shipments": [], "in_stock": [], "untracked": [],
+               "cut_short": False}
+        out["came"] = self._came(item, moves, out, 0, {(item_id, lot)})
+        out["went"] = self._went(item, lot, moves, out, 0, {(item_id, lot)})
+        return out
+
+    def _lot_moves(self, item_id, lot) -> list[dict]:
+        return self._rows("SELECT * FROM stock_moves WHERE item_id = ? AND lot = ? COLLATE NOCASE AND lot <> '' ORDER BY id",
+                          item_id, unicodedata.normalize("NFC", _clean(lot)))
+
+    def _step(self, kind, what, item, code="", qty=0, ref="", who="", date="", note="", children=None) -> dict:
+        return {"kind": kind, "what": what, "item": item, "code": code, "qty": qty, "ref": ref, "who": who, "date": date,
+                "note": note, "children": children or []}
+
+    def _party(self, kind, number) -> str:
+        sql = {"receipt": "SELECT c.name FROM purchase_orders o JOIN contacts c ON c.id = o.supplier_id WHERE o.number = ?",
+               "shipment": "SELECT c.name FROM sales_orders o JOIN contacts c ON c.id = o.customer_id WHERE o.number = ?"}[kind]
+        r = self.conn.execute(sql, (number,)).fetchone()
+        return r[0] if r else ""
+
+    @staticmethod
+    def _completion(m) -> str:
+        return f"{m['ref']} (completion {m['batch']})" if m["batch"] else m["ref"]
+
+    def _completion_moves(self, m, kind) -> list[dict]:
+        """The moves of ``kind`` in the work order completion that move ``m`` was part of."""
+        if not m["batch"]:
+            return []
+        return self._rows("SELECT m.*, i.number, i.description, i.tracking FROM stock_moves m JOIN items i ON i.id = m.item_id "
+                          "WHERE m.ref = ? AND m.batch = ? AND m.kind = ? ORDER BY m.id", m["ref"], m["batch"], kind)
+
+    def _came(self, item, moves, out, depth, seen) -> list[dict]:
+        steps = []
+        for m in moves:
+            if m["qty"] <= 0:
+                continue
+            date = m["time"][:10]
+            if m["kind"] == "receipt":
+                steps.append(self._step("received", "Received", item["number"], m["lot"], m["qty"], m["ref"],
+                                        self._party("receipt", m["ref"]), date))
+            elif m["kind"] == "produce":
+                used = []
+                for u in self._completion_moves(m, "consume"):
+                    if u["lot"] and depth + 1 < TRACE_DEPTH and (u["item_id"], u["lot"]) not in seen:
+                        child = self.item(u["item_id"])
+                        kids = self._came(child, self._lot_moves(u["item_id"], u["lot"]), out, depth + 1, seen | {(u["item_id"], u["lot"])})
+                    else:
+                        kids = []
+                        out["cut_short"] |= bool(u["lot"]) and depth + 1 >= TRACE_DEPTH
+                    note = "" if u["lot"] else UNFOLLOWED.get(u["tracking"], UNFOLLOWED["none"])
+                    used.append(self._step("used", "Made from", u["number"], u["lot"], -u["qty"], self._completion(u), "",
+                                           u["time"][:10], note, kids))
+                steps.append(self._step("made", "Made", item["number"], m["lot"], m["qty"], self._completion(m), "", date,
+                                        children=used))
+            else:
+                steps.append(self._step("adjusted", "Added by adjustment", item["number"], m["lot"], m["qty"], "", "", date,
+                                        m["note"]))
+        return steps
+
+    def _went(self, item, lot, moves, out, depth, seen) -> list[dict]:
+        steps = []
+        for m in moves:
+            if m["qty"] >= 0:
+                continue
+            date = m["time"][:10]
+            if m["kind"] == "shipment":
+                who = self._party("shipment", m["ref"])
+                steps.append(self._step("shipped", "Shipped", item["number"], lot, -m["qty"], m["ref"], who, date))
+                out["shipments"].append({"item": item["number"], "lot": lot, "qty": -m["qty"], "order": m["ref"],
+                                         "customer": who, "date": date})
+            elif m["kind"] == "consume":
+                steps.append(self._step("used", "Used", item["number"], lot, -m["qty"], self._completion(m), "", date,
+                                        children=self._made_from(m, out, depth, seen)))
+            else:
+                steps.append(self._step("adjusted", "Taken out by adjustment", item["number"], lot, -m["qty"], "", "", date,
+                                        m["note"]))
+        have = sum(m["qty"] for m in moves)
+        if have:
+            steps.append(self._step("stock", "In stock", item["number"], lot, have))
+            out["in_stock"].append({"item": item["number"], "lot": lot, "qty": have})
+        return steps
+
+    def _made_from(self, m, out, depth, seen) -> list[dict]:
+        """What the completion that used move ``m`` made, followed onward."""
+        made = []
+        produced = self._completion_moves(m, "produce")
+        if not produced:
+            return [self._step("untracked", "What this completion made can't be found in the ledger", "")]
+        units = {u["serial"]: u for u in self._rows(
+            "SELECT u.* FROM wo_units u JOIN work_orders w ON w.id = u.work_order_id WHERE w.number = ? AND u.batch = ?",
+            m["ref"], m["batch"])}
+        for p in produced:
+            date = p["time"][:10]
+            if p["serial"]:
+                u = units.get(p["serial"], {})
+                made.append(self._step("unit", "Unit made", p["number"], p["serial"], p["qty"], self._completion(p), "", date,
+                                       "in RevisionWorx's unit register" if u.get("rw_unit") else ""))
+                out["units"].append({"item": p["number"], "serial": p["serial"], "order": p["ref"], "made": date,
+                                     "rw_unit": u.get("rw_unit", "")})
+            elif p["lot"]:
+                key = (p["item_id"], p["lot"])
+                if key in seen or depth + 1 >= TRACE_DEPTH:
+                    out["cut_short"] |= key not in seen
+                    kids = []
+                else:
+                    kids = self._went(self.item(p["item_id"]), p["lot"], self._lot_moves(p["item_id"], p["lot"]), out,
+                                      depth + 1, seen | {key})
+                made.append(self._step("made", "Made", p["number"], p["lot"], p["qty"], self._completion(p), "", date,
+                                       children=kids))
+            else:
+                made.append(self._step("untracked", "Made", p["number"], "", p["qty"], self._completion(p), "", date,
+                                       UNFOLLOWED["none"]))
+                out["untracked"].append({"item": p["number"], "qty": p["qty"], "order": self._completion(p), "made": date})
+        return made
 
     # ---- from RevisionWorx
     def import_bom(self, root_number: str, parts: list, lines: list, source: dict) -> dict:

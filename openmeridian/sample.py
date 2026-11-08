@@ -16,26 +16,26 @@ def build(path: str) -> Company:
     bay = c.add_contact("customer", "Bayside Marine", "Sam Ortiz", "sam@example.com", "555-0101", "9 Harbor St\nPort Ellis", 15)
     delta = c.add_contact("supplier", "Delta Motion Supply", "Pat Gray", "orders@example.com", "555-0200", "44 Valve Ave\nTulsa", 30)
     iron = c.add_contact("supplier", "Ironbridge Steel", "Ana Ruiz", "sales@example.org", "555-0201", "2 Mill Lane\nGary", 30)
-    def item(num, desc, kind="buy", cost="0", price="0", rp="0", rq="0", sup=None, lead=0, b=""):
-        return c.add_item(num, desc, kind, "EA", M(cost), M(price), Q(rp), Q(rq), sup, lead, b)
+    def item(num, desc, kind="buy", cost="0", price="0", rp="0", rq="0", sup=None, lead=0, b="", tracking="none"):
+        return c.add_item(num, desc, kind, "EA", M(cost), M(price), Q(rp), Q(rq), sup, lead, b, tracking=tracking)
     pump = item("PMP-10", "Gear pump, 10 cc/rev", cost="185", rp="4", rq="10", sup=delta, lead=10, b="A1")
     motor = item("MTR-7K5", "Electric motor, 7.5 kW", cost="620", rp="2", rq="4", sup=delta, lead=21, b="A2")
     relief = item("VLV-RV160", "Relief valve, 160 bar", cost="74", rp="5", rq="10", sup=delta, lead=7, b="B1")
     dcv = item("VLV-D03", "Directional valve, 4/3, D03", cost="145", rp="4", rq="8", sup=delta, lead=14, b="B2")
     tank = item("TNK-100", "Reservoir, 100 L", cost="240", rp="2", rq="4", sup=iron, lead=14, b="C1")
     frame = item("FRM-200", "Skid frame, welded", cost="310", rp="1", rq="3", sup=iron, lead=14, b="C2")
-    hose = item("HSE-08", "Hose kit, -08", cost="48", rp="10", rq="20", sup=delta, lead=5, b="B4")
+    hose = item("HSE-08", "Hose kit, -08", cost="48", rp="10", rq="20", sup=delta, lead=5, b="B4", tracking="lot")
     hpu = item("HPU-75", "Hydraulic power unit, 7.5 kW", "make", price="4250", rp="1", rq="2", b="F1")
-    manifold = item("MAN-02", "Valve manifold assembly", "make", price="980", b="F2")
+    manifold = item("MAN-02", "Valve manifold assembly", "make", price="980", b="F2", tracking="lot")
     for child, qty in ((pump, "1"), (motor, "1"), (tank, "1"), (frame, "1"), (manifold, "1"), (hose, "2")):
         c.set_bom_line(hpu, child, Q(qty))
     for child, qty in ((relief, "1"), (dcv, "2")):
         c.set_bom_line(manifold, child, Q(qty))
     po = c.create_purchase_order(delta, reference="Stock")
-    for it, qty, cost in ((pump, "6", "185"), (motor, "2", "620"), (relief, "6", "74"), (dcv, "6", "145"), (hose, "12", "48")):
-        c.add_purchase_line(po, it, Q(qty), M(cost))
+    lines = {it: c.add_purchase_line(po, it, Q(qty), M(cost))
+             for it, qty, cost in ((pump, "6", "185"), (motor, "2", "620"), (relief, "6", "74"), (dcv, "6", "145"), (hose, "12", "48"))}
     c.place_purchase_order(po)
-    c.receive_purchase_order(po)
+    c.receive_purchase_order(po, lots={lines[hose]: "DM-26-1104"})
     po2 = c.create_purchase_order(iron, reference="Stock")
     c.add_purchase_line(po2, tank, Q("3"), M("240"))
     c.add_purchase_line(po2, frame, Q("2"), M("310"))
@@ -46,7 +46,7 @@ def build(path: str) -> Company:
     c.complete_work_order(wo)
     wo2 = c.create_work_order(hpu, Q("1"), (date.today() + timedelta(days=7)).isoformat())
     c.release_work_order(wo2, rw_note="No controlled document linked")
-    c.complete_work_order(wo2)
+    c.complete_work_order(wo2, lots={manifold: [("WO-00001", Q("1"))], hose: [("DM-26-1104", Q("2"))]})
     so = c.create_sales_order(acme, (date.today() + timedelta(days=14)).isoformat(), "PO 44182")
     c.add_sales_line(so, hpu, Q("1"))
     c.confirm_sales_order(so)

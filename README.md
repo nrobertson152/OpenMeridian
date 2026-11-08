@@ -25,6 +25,10 @@ you can optionally [support development on Ko-fi](https://ko-fi.com/nr270343).
   PDFs and CSV exports.
 - **Purchasing.** Purchase orders, partial receipts, what's late.
 - **Production.** Work orders that reserve parts, consume them on completion and show what's short.
+- **Lots.** A part bought or made in lots says which lot at every step: received as the supplier's lot, used on a work
+  order, made as a lot of its own, shipped. **Trace** follows a lot to the lots and units made from it and the
+  customers they were shipped to, and back to where it came from, for a recall. Lots to use are filled in oldest first,
+  for you to check: what's recorded is what you say went.
 - **Planning.** What to buy and make to cover demand and reorder points, through every BOM level. You review the
   suggestions, and they become draft orders.
 - **Find anything.** Ctrl+K searches every record. Every list has filters and a panel for what you've selected, with
@@ -62,8 +66,12 @@ OpenMeridian is deliberately small, and a simple result mustn't look like an exa
 - **Planning is not scheduling.** It ignores capacity and dates of individual demands. The "earliest" date is today plus
   that item's own lead time, without adding the levels below it.
 - **One location, and serial numbers only for units you make.** Bins are a note on the item. A serial is recorded when
-  a unit is made; shipping doesn't yet record which serial went to which customer, and bought parts have no lots or
-  serials here (RevisionWorx records what's fitted in a unit).
+  a unit is made; shipping or using it in another work order doesn't yet record which serial went, so a trace lists
+  the units a lot went into but can't follow them further (RevisionWorx's unit register says where each unit is, and
+  what's fitted in it). Bought parts have lots here, not serials.
+- **A trace is only as good as what was recorded.** Lots are followed whole: if more stock was added to a lot made from
+  the one traced, that is followed too, so a recall can be wider than it needs to be but not narrower. Stock moved
+  before lots were tracked on an item can't be traced.
 - **One person at a time.** A company file on your own disk is the supported setup. Using one over a network share has
   **not** been tested, and SQLite's locking can't be relied on over network filesystems.
 - **The logo is placeholder artwork.**

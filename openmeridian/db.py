@@ -13,7 +13,7 @@ import sqlite3
 from datetime import datetime
 
 APPLICATION_ID = 0x4F4D4552      # "OMER"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class CompanyFileError(ValueError):
@@ -123,6 +123,24 @@ CREATE TRIGGER wo_units_fixed BEFORE UPDATE OF id, work_order_id, item_id, seria
     BEGIN SELECT RAISE(ABORT, 'a unit built keeps its serial, work order and what it was built as'); END;
 CREATE TRIGGER wo_units_registered BEFORE UPDATE OF rw_unit ON wo_units WHEN OLD.rw_unit <> '' AND NEW.rw_unit IS NOT OLD.rw_unit
     BEGIN SELECT RAISE(ABORT, 'a unit registered in RevisionWorx keeps its id there'); END;
+""",
+    # Lots. Format 2 reserved them and OpenMeridian refused to set one, so an item marked 'lot' there anyway has no lot
+    # behind any of its stock: it goes back to untracked before the rules below start to hold.
+    3: """
+UPDATE items SET tracking = 'none' WHERE tracking = 'lot';
+ALTER TABLE stock_moves ADD COLUMN batch INTEGER NOT NULL DEFAULT 0 CHECK (batch >= 0);
+CREATE INDEX stock_moves_lot ON stock_moves (item_id, lot);
+CREATE INDEX stock_moves_ref ON stock_moves (ref, batch);
+CREATE TRIGGER stock_moves_lot_named BEFORE INSERT ON stock_moves
+    WHEN (NEW.lot = '') = ((SELECT tracking FROM items WHERE id = NEW.item_id) = 'lot')
+    BEGIN SELECT RAISE(ABORT, 'a move of an item tracked by lot names its lot, and no other move names one'); END;
+CREATE TRIGGER stock_moves_lot_covered BEFORE INSERT ON stock_moves
+    WHEN NEW.lot <> '' AND NEW.qty < 0
+     AND (SELECT COALESCE(SUM(qty), 0) FROM stock_moves WHERE item_id = NEW.item_id AND lot = NEW.lot) + NEW.qty < 0
+    BEGIN SELECT RAISE(ABORT, 'a lot cannot give more than it has'); END;
+CREATE TRIGGER items_tracking_needs_no_stock BEFORE UPDATE OF tracking ON items
+    WHEN NEW.tracking IS NOT OLD.tracking AND (SELECT COALESCE(SUM(qty), 0) FROM stock_moves WHERE item_id = OLD.id) <> 0
+    BEGIN SELECT RAISE(ABORT, 'an item starts or stops being tracked only while none of it is in stock'); END;
 """,
 }
 

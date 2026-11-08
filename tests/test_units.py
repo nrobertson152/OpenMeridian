@@ -61,7 +61,7 @@ def test_a_format_1_file_is_upgraded_with_a_verified_copy_of_it_kept_first(old_f
     original = {t: _rows(old_file, t, cols) for t, cols in before.items()}
     c = Company.open(str(old_file))
     try:
-        assert c.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 2
+        assert c.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 3
         kept = tmp_path / "Acme (format 1 backup).meridian"
         con = sqlite3.connect(kept)
         assert con.execute("PRAGMA user_version").fetchone()[0] == 1
@@ -74,7 +74,7 @@ def test_a_format_1_file_is_upgraded_with_a_verified_copy_of_it_kept_first(old_f
             if table == "audit":
                 assert now[:-1] == original[table]
                 assert now[-1][3] == "format.upgrade" and now[-1][4] == (
-                    "format 1 to 2; the file as it was is kept as Acme (format 1 backup).meridian")
+                    "format 1 to 3; the file as it was is kept as Acme (format 1 backup).meridian")
             elif table == "settings":
                 assert [r for r in now if r[0] != "company_id"] == original[table]
             else:
@@ -140,8 +140,6 @@ def test_serial_numbers_are_for_items_made_and_stock_must_be_zero_to_change(setu
     s, c = setup, setup.c
     with pytest.raises(ERPError, match="items you make"):
         c.update_item(s.a, tracking="serial")
-    with pytest.raises(ERPError, match="by lot isn't available"):
-        c.update_item(s.x, tracking="lot")
     with pytest.raises(ERPError, match="items you make"):
         c.add_item("NEW", "Bought", "buy", tracking="serial")
     c.update_item(s.x, tracking="serial")
@@ -151,6 +149,8 @@ def test_serial_numbers_are_for_items_made_and_stock_must_be_zero_to_change(setu
     c.adjust_stock(s.x, Q("1"), "found one")
     with pytest.raises(ERPError, match="has to be zero"):
         c.update_item(s.x, tracking="none")
+    with pytest.raises(ERPError, match="has to be zero"):
+        c.update_item(s.x, tracking="lot")
     assert c.item(s.x)["tracking"] == "serial"
 
 

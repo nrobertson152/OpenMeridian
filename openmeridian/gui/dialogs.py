@@ -9,13 +9,14 @@ from PySide6.QtCore import Qt, qVersion
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import APP_NAME, COPYRIGHT, DONATE_URL, LICENSE_NAME, LICENSE_URL, VERSION
+from .. import APP_NAME, COPYRIGHT, DONATE_URL, LICENSE_NAME, LICENSE_URL, VERSION, tracing
 from ..company import ERPError
+from ..report_csv import to_csv
 from ..values import ValueProblem, fmt_qty, parse_money, parse_qty
 from . import theme as th
-from .widgets import Combo, button, label
+from .widgets import Combo, StatusBlock, button, label
 
 
 def money_text(cents) -> str:
@@ -94,13 +95,14 @@ class ItemDialog(FormDialog):
         self.number = self.line("Item number", i.get("number", ""), "Part number")
         self.desc = self.line("Description", i.get("description", ""))
         self.kind = self.combo("Type", [("Buy", "buy"), ("Make", "make")], i.get("kind", "buy"))
-        self.tracking = self.combo("Serial numbers", [("No", "none"), ("Yes: each unit made has one", "serial")],
+        self.tracking = self.combo("Tracking", [("None", "none"), ("Serial numbers: each unit made has one", "serial"),
+                                                ("Lots: each receipt, use and shipment says which", "lot")],
                                    i.get("tracking", "none"))
 
         def made_only():                    # serial numbers are for units made; a bought item has none here
             make = self.kind.currentData() == "make"
-            self.tracking.setEnabled(make)
-            if not make:
+            self.tracking.model().item(self.tracking.findData("serial")).setEnabled(make)
+            if not make and self.tracking.currentData() == "serial":
                 self.tracking.setCurrentIndex(self.tracking.findData("none"))
         self.kind.currentIndexChanged.connect(lambda _i: made_only())
         made_only()
@@ -211,32 +213,83 @@ class LineDialog(FormDialog):
         return fn(self.order_id, self.item_box.currentData(), parse_qty(self.qty.text()), parse_money(self.amount.text()))
 
 
-class QuantitiesDialog(QDialog):
-    """Ship or receive: one row per line, filled in with everything outstanding. Partial quantities are fine."""
+def _fixed(text) -> QTableWidgetItem:
+    it = QTableWidgetItem(text)
+    it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+    return it
 
-    def __init__(self, app, title, intro, rows, apply_fn, ok_text):
+
+class QuantitiesDialog(QDialog):
+    """Ship or receive: one row per line, filled in with everything outstanding. Partial quantities are fine.
+
+    Receiving (``lots_in`` true), a line of an item tracked by lot has a Lot cell for the lot it came in as. Shipping, it
+    has a row under it for each of its lots in stock, filled in oldest first for someone to check: the line ships what
+    those rows say."""
+
+    def __init__(self, app, title, intro, rows, apply_fn, ok_text, lots_in=False):
         super().__init__(app.window)
         self.setWindowTitle(title)
-        self.setMinimumWidth(560)
-        self.rows, self.apply_fn = rows, apply_fn
+        self.setMinimumWidth(600)
+        self.app, self.rows, self.apply_fn, self.lots_in = app, rows, apply_fn, lots_in
+        c = app.company
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 14)
         lay.addWidget(label(intro, "muted", wrap=True))
-        self.table = QTableWidget(len(rows), 4)
-        self.table.setHorizontalHeaderLabels(["Item", "Description", "Outstanding", "This time"])
+        tracked = any(r["tracking"] == "lot" for r in rows)
+        heads = ["Item", "Description", "Outstanding", "This time"] + (["Lot"] if lots_in and tracked else [])
+        self.table = QTableWidget(0, len(heads))
+        self.table.setHorizontalHeaderLabels(heads)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
-        for r, row in enumerate(rows):
-            for c, v in enumerate((row["number"], row["description"], fmt_qty(row["left"]))):
-                it = QTableWidgetItem(v)
-                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                self.table.setItem(r, c, it)
-            self.table.setItem(r, 3, QTableWidgetItem(fmt_qty(row["left"])))
-        self.table.setFixedHeight(min(320, 40 + 30 * len(rows)))
+        self.line_row, self.lot_rows = {}, {}          # line id -> its table row; line id -> [(table row, lot)]
+        self.lot_edits: dict[int, QLineEdit] = {}     # receiving: line id -> where its lot is typed
+        for row in rows:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.line_row[row["id"]] = r
+            for col, v in enumerate((row["number"], row["description"], fmt_qty(row["left"]))):
+                self.table.setItem(r, col, _fixed(v))
+            if row["tracking"] != "lot":
+                self.table.setItem(r, 3, QTableWidgetItem(fmt_qty(row["left"])))
+                if len(heads) > 4:
+                    self.table.setItem(r, 4, _fixed("—"))
+            elif lots_in:
+                self.table.setItem(r, 3, QTableWidgetItem(fmt_qty(row["left"])))
+                lot = QLineEdit()
+                lot.setPlaceholderText("Supplier's lot")
+                lot.setToolTip("The lot it came in as: the supplier's lot or batch number")
+                self.lot_edits[row["id"]] = lot
+                self.table.setCellWidget(r, 4, lot)
+            else:
+                picks = dict(c.suggest_lots(row["item_id"], row["left"]))
+                self.lot_rows[row["id"]] = []
+                for have in c.lots(row["item_id"], in_stock=True):
+                    s = self.table.rowCount()
+                    self.table.insertRow(s)
+                    self.table.setItem(s, 0, _fixed(""))
+                    self.table.setItem(s, 1, _fixed(f"lot {have['lot']}, {fmt_qty(have['on_hand'])} on hand"))
+                    self.table.setItem(s, 2, _fixed(""))
+                    self.table.setItem(s, 3, QTableWidgetItem(fmt_qty(picks.get(have["lot"], 0))))
+                    self.lot_rows[row["id"]].append((s, have["lot"]))
+                if not self.lot_rows[row["id"]]:
+                    s = self.table.rowCount()
+                    self.table.insertRow(s)
+                    self.table.setItem(s, 1, _fixed("no lots in stock"))
+                    for col in (0, 2):
+                        self.table.setItem(s, col, _fixed(""))
+                    self.table.setItem(s, 3, _fixed(""))
+                self.table.setItem(r, 3, _fixed(fmt_qty(sum(picks.values()))))
+        self.table.itemChanged.connect(self._totals)
+        if len(heads) > 4:
+            self.table.setColumnWidth(4, 170)
+            self.setMinimumWidth(760)
+        self.table.setFixedHeight(min(360, 40 + 30 * self.table.rowCount()))
         lay.addWidget(self.table)
+        if tracked and not lots_in:
+            lay.addWidget(label("Lots are filled in oldest first. Change them to the lots that are going.", "small", wrap=True))
         self.message = label("", "small", wrap=True)
         self.message.setStyleSheet(f"color: {app.theme.ui['danger']};")
         self.message.hide()
@@ -249,10 +302,33 @@ class QuantitiesDialog(QDialog):
         box.rejected.connect(self.reject)
         lay.addWidget(box)
 
+    def _lot_picks(self, line_id):
+        return [(lot, parse_qty(self.table.item(s, 3).text())) for s, lot in self.lot_rows[line_id]]
+
+    def _totals(self, item):
+        """A line shipping from lots ships what its lot rows add up to."""
+        for line_id, lot_rows in self.lot_rows.items():
+            if any(s == item.row() for s, _lot in lot_rows):
+                try:
+                    total = fmt_qty(sum(q for _lot, q in self._lot_picks(line_id)))
+                except ValueProblem:
+                    total = "?"
+                self.table.blockSignals(True)
+                self.table.item(self.line_row[line_id], 3).setText(total)
+                self.table.blockSignals(False)
+
     def submit(self):
         try:
-            q = {row["id"]: parse_qty(self.table.item(r, 3).text()) for r, row in enumerate(self.rows)}
-            self.apply_fn(q)
+            q, lots = {}, {}
+            for row in self.rows:
+                if row["id"] in self.lot_rows:
+                    lots[row["id"]] = [(lot, n) for lot, n in self._lot_picks(row["id"]) if n]
+                    q[row["id"]] = sum(n for _lot, n in lots[row["id"]])
+                else:
+                    q[row["id"]] = parse_qty(self.table.item(self.line_row[row["id"]], 3).text())
+                    if row["id"] in self.lot_edits:
+                        lots[row["id"]] = self.lot_edits[row["id"]].text()
+            self.apply_fn(q, lots)
         except (ERPError, ValueProblem) as e:
             self.message.setText(str(e))
             self.message.show()
@@ -261,16 +337,19 @@ class QuantitiesDialog(QDialog):
 
 
 class CompleteDialog(FormDialog):
-    """Complete a work order: how many were made and, for an item made with serial numbers, the serial of each."""
+    """Complete a work order: how many were made and, for an item made with serial numbers, the serial of each. A
+    component tracked by lot says which lots went in (filled in oldest first, for someone to check), and an item made
+    that is tracked by lot is given its lot."""
 
     def __init__(self, app, wo, item):
         super().__init__(app, f"Complete {wo['number']}", "Complete")
         self.wo, self.item = wo, item
+        c = app.company
         left = wo["qty"] - wo["done"]
         intro = "Components leave stock and finished goods come in at their actual cost."
         if item["tracking"] == "serial":
             intro += (f" Each {item['number']} made has its own serial number: one per line, as on its plate."
-                      + (" They're registered in RevisionWorx's unit register as built." if app.company.setting("rw_workspace")
+                      + (" They're registered in RevisionWorx's unit register as built." if c.setting("rw_workspace")
                          else ""))
         self.form.addRow(label(intro, "muted", wrap=True))
         self.qty = self.line("Made this time", fmt_qty(left))
@@ -278,11 +357,62 @@ class CompleteDialog(FormDialog):
         if self.serials is not None:
             self.serials.setFixedHeight(110)
             self.serials.setPlaceholderText("NH-26-0001\nNH-26-0002")
+        self.made_lot = self.line("Lot made", c.default_made_lot(wo["id"])) if item["tracking"] == "lot" else None
+        self.tracked = [b for b in c.bom(wo["item_id"]) if c.item(b["child_id"])["tracking"] == "lot"]
+        self.lot_rows: list[tuple[int, int, str]] = []     # (table row, component item id, lot)
+        self.lots = None
+        if self.tracked:
+            self.form.addRow(label("Lots used, filled in oldest first. Change them to the lots that went in.", "small", wrap=True))
+            self.lots = QTableWidget(0, 4)
+            self.lots.setHorizontalHeaderLabels(["Component", "Lot", "On hand", "Used"])
+            self.lots.verticalHeader().setVisible(False)
+            self.lots.setShowGrid(False)
+            self.lots.verticalHeader().setDefaultSectionSize(28)
+            self.lots.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.lots.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+            for b in self.tracked:
+                for have in c.lots(b["child_id"], in_stock=True):
+                    r = self.lots.rowCount()
+                    self.lots.insertRow(r)
+                    for col, v in enumerate((b["number"], have["lot"], fmt_qty(have["on_hand"]))):
+                        self.lots.setItem(r, col, _fixed(v))
+                    self.lots.setItem(r, 3, QTableWidgetItem(""))
+                    self.lot_rows.append((r, b["child_id"], have["lot"]))
+                if not any(cid == b["child_id"] for _r, cid, _l in self.lot_rows):
+                    r = self.lots.rowCount()
+                    self.lots.insertRow(r)
+                    for col, v in enumerate((b["number"], "no lots in stock", "", "")):
+                        self.lots.setItem(r, col, _fixed(v))
+            self.lots.setFixedHeight(min(240, 34 + 28 * max(1, self.lots.rowCount())))
+            self.form.addRow(self.lots)
+            self.qty.textChanged.connect(lambda _t: self._fill_lots())
+            self._fill_lots()
+
+    def _fill_lots(self):
+        """Oldest lots first for what this many takes, as a starting point."""
+        try:
+            q = parse_qty(self.qty.text())
+        except ValueProblem:
+            return
+        c = self.app.company
+        uses = {b["child_id"]: b["use"] for b in c.work_order_uses(self.wo["id"], max(q, 0))}
+        for b in self.tracked:
+            picks = dict(c.suggest_lots(b["child_id"], uses.get(b["child_id"], 0)))
+            for r, cid, lot in self.lot_rows:
+                if cid == b["child_id"]:
+                    self.lots.item(r, 3).setText(fmt_qty(picks.get(lot, 0)))
 
     def apply(self):
         q = parse_qty(self.qty.text(), "the quantity made")
         serials = None if self.serials is None else self.serials.toPlainText().splitlines()
-        self.app.company.complete_work_order(self.wo["id"], q, serials)
+        lots = {}
+        for r, cid, lot in self.lot_rows:
+            n = parse_qty(self.lots.item(r, 3).text() or "0", f"the quantity of lot {lot} used")
+            lots.setdefault(cid, [])
+            if n:
+                lots[cid].append((lot, n))
+        made = None if self.made_lot is None else self.made_lot.text()
+        self.app.company.complete_work_order(self.wo["id"], q, serials, lots or None, made)
         return q
 
 
@@ -316,15 +446,24 @@ class BomLineDialog(FormDialog):
 
 
 class AdjustDialog(FormDialog):
-    def __init__(self, app, item):
+    def __init__(self, app, item, lot=""):
         super().__init__(app, f"Adjust stock: {item['number']}", "Post to ledger")
         self.item = item
         self.form.addRow("On hand", QLabel(fmt_qty(item["on_hand"])))
+        self.lot = None
+        if item["tracking"] == "lot":           # a lot in stock, or a new one typed in when stock goes up
+            self.lot = self.combo("Lot", [(f"{l['lot']}", l["lot"]) for l in app.company.lots(item["id"], in_stock=True)])
+            self.lot.setEditable(True)
+            self.lot.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            self.lot.lineEdit().setPlaceholderText("Choose a lot in stock, or type a new one")
+            self.lot.setCurrentIndex(-1)
+            self.lot.setCurrentText(lot)
         self.delta = self.line("Change by", "", "e.g. 5 or -2")
         self.note = self.line("Reason", "", "Goes in the ledger")
 
     def apply(self):
-        self.app.company.adjust_stock(self.item["id"], parse_qty(self.delta.text()), self.note.text())
+        self.app.company.adjust_stock(self.item["id"], parse_qty(self.delta.text()), self.note.text(),
+                                      lot=self.lot.currentText() if self.lot is not None else "")
 
 
 class PickDialog(QDialog):
@@ -372,6 +511,68 @@ class PickDialog(QDialog):
         if it:
             self.chosen = it.data(Qt.ItemDataRole.UserRole)
             self.accept()
+
+
+class TraceDialog(QDialog):
+    """Where a lot came from and where it went (Company.trace_lot), with what it reached said first, for a recall."""
+
+    COLUMNS = ["What", "Item", "Lot or serial", "Qty", "Reference", "Customer or supplier", "Date", "Note"]
+
+    def __init__(self, app, item_id, lot):
+        super().__init__(app.window)
+        self.app = app
+        self.trace = t = app.company.trace_lot(item_id, lot)
+        self.setWindowTitle(f"Trace lot {t['lot']} of {t['item']}")
+        self.resize(980, 560)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.addWidget(StatusBlock(app.theme, "info", f"Lot {t['lot']} of {t['item']} ({t['description']})", tracing.summary(t)))
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(len(self.COLUMNS))
+        self.tree.setHeaderLabels(self.COLUMNS)
+        self.tree.setUniformRowHeights(True)
+        for key, title in tracing.SECTIONS:
+            top = QTreeWidgetItem([title])
+            self.tree.addTopLevelItem(top)
+            self._add(top, t[key])
+            if not t[key]:
+                top.addChild(QTreeWidgetItem(["Nothing recorded"]))
+        self.tree.expandAll()
+        for col in range(len(self.COLUMNS)):
+            self.tree.resizeColumnToContents(col)
+        lay.addWidget(self.tree, 1)
+        lay.addWidget(label("A lot is followed whole: if more was added to a lot made from it, that is followed too, so a "
+                            "recall is never too narrow. Units are listed where they were made; RevisionWorx's unit "
+                            "register says where each one is now.", "small", wrap=True))
+        box = QDialogButtonBox()
+        save = box.addButton("Save as CSV…", QDialogButtonBox.ButtonRole.ActionRole)
+        save.clicked.connect(self.save_csv)
+        box.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    def _add(self, parent, steps):
+        for s in steps:
+            node = QTreeWidgetItem([s["what"], s["item"], s["code"], fmt_qty(s["qty"]) if s["qty"] else "", s["ref"],
+                                    s["who"], s["date"], s["note"]])
+            node.setTextAlignment(3, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            parent.addChild(node)
+            self._add(node, s["children"])
+
+    def save_csv(self, path=None):
+        t = self.trace
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Save the trace", f"Trace {t['item']} lot {t['lot']}.csv",
+                                                  "CSV file (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(to_csv(tracing.HEADERS, tracing.rows(t)))
+        except OSError as e:
+            self.app.error(str(e))
+            return
+        self.app.toast("Trace saved", "success")
 
 
 class SettingsDialog(FormDialog):
