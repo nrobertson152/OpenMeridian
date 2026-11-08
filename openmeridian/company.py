@@ -983,8 +983,8 @@ class Company:
         children}. A lot used on a work order leads to what that completion made: lots made are followed in turn (the
         whole lot, so a lot others were added to is followed with them, which can only widen a recall), units made are
         listed by serial, and an item made that isn't tracked ends the trail, saying so. A lot that came from a work
-        order shows what that completion used. ``units``, ``shipments``, ``in_stock`` and ``untracked`` gather what the
-        lot reached, for a recall."""
+        order shows what that completion used. ``units``, ``shipments``, ``in_stock``, ``untracked`` and ``lots`` (the lot
+        traced, then every lot made from it) gather what the lot reached, for a recall."""
         item = self.item(item_id)
         if item is None:
             raise ERPError("No such item.")
@@ -994,7 +994,7 @@ class Company:
         lot = moves[0]["lot"]
         out = {"item": item["number"], "description": item["description"], "unit": item["unit"], "lot": lot,
                "on_hand": sum(m["qty"] for m in moves), "units": [], "shipments": [], "in_stock": [], "untracked": [],
-               "cut_short": False}
+               "lots": [{"item": item["number"], "lot": lot}], "cut_short": False}
         out["came"] = self._came(item, moves, out, 0, {(item_id, lot)})
         out["went"] = self._went(item, lot, moves, out, 0, {(item_id, lot)})
         return out
@@ -1102,6 +1102,8 @@ class Company:
                                       depth + 1, seen | {key})
                 made.append(self._step("made", "Made", p["number"], p["lot"], p["qty"], self._completion(p), "", date,
                                        children=kids))
+                if {"item": p["number"], "lot": p["lot"]} not in out["lots"]:
+                    out["lots"].append({"item": p["number"], "lot": p["lot"]})
             else:
                 made.append(self._step("untracked", "Made", p["number"], "", p["qty"], self._completion(p), "", date,
                                        UNFOLLOWED["none"]))

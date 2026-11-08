@@ -51,6 +51,9 @@ orders build (below).
 - **Out of step:** when engineering releases a new revision, the Overview, the sidebar and the item say which BOMs and
   work orders were made from an older one. Nothing changes until someone imports the new one.
 - **Open engineering changes** are shown beside the documents.
+- **A recall says where the units are.** From a lot's trace, **Where are they now?** asks RevisionWorx's unit register
+  where each unit made from it is (customer, site, status). It also lists the units the register records the lot fitted
+  in that the stock ledger can't know about, such as a spare fitted on site. It only reads.
 - **Units built go into RevisionWorx's unit register.** An item can be made with serial numbers: completing its work
   order asks for the serial of each unit, and registers them in RevisionWorx as built, as that item, to the revision the
   work order was released to. A retry never registers anything twice. Anything RevisionWorx refuses (a serial it already

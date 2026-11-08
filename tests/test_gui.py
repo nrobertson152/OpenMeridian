@@ -719,3 +719,61 @@ def test_a_trace_is_readable_on_every_theme(sample, qapp):
         assert (below.red(), below.green(), below.blue()) == (surface.red(), surface.green(), surface.blue()), name
         assert d.tree.palette().color(d.tree.foregroundRole()).name() == QColor(sample.theme.ui["text"]).name(), name
         d.close()
+
+
+def test_a_trace_asks_revisionworx_where_the_units_are_only_when_asked(app, qapp, tmp_path, monkeypatch):
+    c, _sup, cus, hose, kit, po, line = _lot_company(app, tmp_path)
+    c.receive_purchase_order(po, None, {line: "H-1"})
+    hpu = c.add_item("HPU", "Power unit", "make", tracking="serial")
+    c.set_bom_line(hpu, hose, Q("1"))
+    wo = c.create_work_order(hpu, Q("1"))
+    c.release_work_order(wo)
+    c.complete_work_order(wo, Q("1"), ["NH-1"], lots={hose: [("H-1", Q("1"))]})
+    monkeypatch.setattr(dlg.TraceDialog, "exec", lambda self: 0)
+    assert dlg.TraceDialog(app, hose, "H-1").ask is None, "not connected to RevisionWorx: nothing to ask"
+
+    class Register:
+        available = True
+        asked = []
+
+        def has(self, feature):
+            return True
+
+        def units(self):
+            self.asked.append("units")
+            return [{"id": "unt_" + "1" * 32, "label": "NH-1", "status": "in-service", "customer": "Acme",
+                     "site": "Milltown", "location": "", "identifiers": [{"scheme": "serial", "value": "NH-1", "issuer": ""}]}]
+
+        def where_used(self, part_number, lot="", history=True):
+            self.asked.append((part_number, lot))
+            return [{"unit": {"id": "unt_" + "9" * 32, "label": "NH-9", "status": "in-service", "customer": "Bayside",
+                              "site": "", "location": "", "identifiers": []},
+                     "position": "H3", "current": True, "fitted_on": "2026-11-20", "lot": lot}]
+    register = Register()
+    c.set_setting("rw_workspace", str(tmp_path / "eng"))
+    monkeypatch.setattr(app, "rw_client", lambda: register)
+    d = dlg.TraceDialog(app, hose, "H-1")
+    assert register.asked == [], "opening a trace asks RevisionWorx nothing"
+    assert d.ask is not None and d.ask.text() == "Where are they now?"
+    d.ask.click()
+    pump(qapp)
+    assert register.asked == ["units", ("HSE", "H-1")]
+    top = [d.tree.topLevelItem(i).text(0) for i in range(d.tree.topLevelItemCount())]
+    assert top == ["Where it came from", "Where it went", "In RevisionWorx"] and not d.ask.isEnabled()
+    found = d.tree.topLevelItem(2)
+    assert [(found.child(i).text(0), found.child(i).text(4), found.child(i).text(5)) for i in range(found.childCount())] == [
+        ("Unit", "NH-1", "Acme, Milltown"), ("Fitted at H3", "NH-9", "Bayside")]
+    assert "fitted in NH-9, which the stock ledger can't know" in d.rw_text.text()
+    d.save_csv(str(tmp_path / "recall.csv"))
+    assert "In RevisionWorx,0,Fitted at H3,HSE,H-1,,NH-9,Bayside,2026-11-20" in (tmp_path / "recall.csv").read_text(encoding="utf-8-sig")
+    assert not app.errors
+
+    class Down(Register):
+        def units(self):
+            from openmeridian.revisionworx import RevisionWorxError
+            raise RevisionWorxError("the workspace is busy: someone else is saving", "busy")
+    monkeypatch.setattr(app, "rw_client", lambda: Down())
+    e = dlg.TraceDialog(app, hose, "H-1")
+    e.ask.click()
+    pump(qapp)
+    assert app.errors and "couldn't answer, so nothing was added" in app.errors[-1] and e.tree.topLevelItemCount() == 2

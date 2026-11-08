@@ -7,13 +7,14 @@ import webbrowser
 from PySide6 import __version__ as pyside_version
 from PySide6.QtCore import Qt, qVersion
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
                                QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, COPYRIGHT, DONATE_URL, LICENSE_NAME, LICENSE_URL, VERSION, tracing
 from ..company import ERPError
 from ..report_csv import to_csv
+from ..revisionworx import RevisionWorxError
 from ..values import ValueProblem, fmt_qty, parse_money, parse_qty
 from . import theme as th
 from .widgets import Combo, StatusBlock, button, label
@@ -544,7 +545,17 @@ class TraceDialog(QDialog):
         lay.addWidget(label("A lot is followed whole: if more was added to a lot made from it, that is followed too, so a "
                             "recall is never too narrow. Units are listed where they were made; RevisionWorx's unit "
                             "register says where each one is now.", "small", wrap=True))
+        self.rw = None
+        self.rw_text = label("", "small", wrap=True)
+        self.rw_text.hide()
+        lay.addWidget(self.rw_text)
         box = QDialogButtonBox()
+        self.ask = None
+        if app.company.setting("rw_workspace"):
+            self.ask = box.addButton("Where are they now?", QDialogButtonBox.ButtonRole.ActionRole)
+            self.ask.setToolTip("Ask RevisionWorx's unit register where each unit is, and which other units have these "
+                                "lots fitted. Nothing is written there.")
+            self.ask.clicked.connect(self.ask_revisionworx)
         save = box.addButton("Save as CSV…", QDialogButtonBox.ButtonRole.ActionRole)
         save.clicked.connect(self.save_csv)
         box.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
@@ -559,6 +570,35 @@ class TraceDialog(QDialog):
             parent.addChild(node)
             self._add(node, s["children"])
 
+    def ask_revisionworx(self):
+        """Add what RevisionWorx's unit register says of the units and lots reached. Only reads."""
+        client = self.app.rw_client()
+        if not client or not client.available:
+            self.app.error("RevisionWorx isn't connected, so it can't be asked. Check its workspace in Settings.")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.rw = tracing.in_revisionworx(self.trace, client)
+        except RevisionWorxError as e:
+            self.rw = None
+            QApplication.restoreOverrideCursor()
+            self.app.error(f"RevisionWorx couldn't answer, so nothing was added. ({e})")
+            return
+        QApplication.restoreOverrideCursor()
+        top = QTreeWidgetItem(["In RevisionWorx"])
+        self.tree.addTopLevelItem(top)
+        rows = tracing.rw_rows(self.rw)
+        for row in rows:
+            top.addChild(QTreeWidgetItem(row[2:]))
+        if not rows:
+            top.addChild(QTreeWidgetItem(["Nothing recorded"]))
+        top.setExpanded(True)
+        for col in range(len(self.COLUMNS)):
+            self.tree.resizeColumnToContents(col)
+        self.rw_text.setText(tracing.rw_summary(self.rw))
+        self.rw_text.show()
+        self.ask.setEnabled(False)
+
     def save_csv(self, path=None):
         t = self.trace
         if path is None:
@@ -568,7 +608,7 @@ class TraceDialog(QDialog):
             return
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                f.write(to_csv(tracing.HEADERS, tracing.rows(t)))
+                f.write(to_csv(tracing.HEADERS, tracing.rows(t) + (tracing.rw_rows(self.rw) if self.rw else [])))
         except OSError as e:
             self.app.error(str(e))
             return
