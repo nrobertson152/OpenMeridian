@@ -13,6 +13,10 @@ warnings and open engineering changes).
   (`revisionworx link unit-register`, with a txid from the completion, so a retry never registers twice): the one write
   OpenMeridian makes to RevisionWorx, by the Director's decision. What RevisionWorx refuses stays listed, with its
   reason, and **Register in RevisionWorx** tries again.
+- **Factory lots in RevisionWorx.** Registering a completion's units now sends the lots that completion used with them, in
+  the same call and under the same txid (the Director's decision, 2026-11-08). RevisionWorx shows a unit's factory lots,
+  and says how many units were built with them. A RevisionWorx without its `unit-lots` feature is sent nothing: the
+  units stay listed, with why. A recall doesn't list units this company registered twice.
 - **Company file format 2.** Older files are upgraded when opened, after a verified copy of the file as it was is kept
   beside it (`NAME (format 1 backup).meridian`). See [docs/COMPANY_FILE.md](docs/COMPANY_FILE.md).
 - **Lots.** An item bought or made can be tracked by lot. Receiving it asks for the supplier's lot; completing a work

@@ -896,8 +896,9 @@ class Company:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
     def register_units(self, wid, client) -> dict:
-        """Register in RevisionWorx the units this work order made that aren't registered yet, one completion at a time:
-        RevisionWorx records all of a completion's units or none. ``client`` is a revisionworx.Client.
+        """Register in RevisionWorx the units this work order made that aren't registered yet, with the lots their completion
+        used, one completion at a time: RevisionWorx records all of a completion's units or none. ``client`` is a
+        revisionworx.Client.
 
         Every attempt at a completion sends the same thing (its txid, all of its serials, and what they were built as,
         kept when they were made), so RevisionWorx records it once however often it is asked, and an earlier attempt
@@ -909,6 +910,16 @@ class Company:
         batches: dict[int, list[dict]] = {}
         for u in self.units_built(wid):
             batches.setdefault(u["batch"], []).append(u)
+        # The lots each completion used go with its units (Director's decision, 2026-11-08). The ledger never changes, so
+        # every attempt sends the same lots (a part renumbered in between changes its number, and RevisionWorx then refuses
+        # the retry, saying so); a completion that used none sends none, as before.
+        lots: dict[int, list[dict]] = {}
+        units_of = {}
+        for m in self.work_order_lots(wid):
+            if m["kind"] == "consume":
+                unit = units_of.setdefault(m["item_id"], (self.item(m["item_id"]) or {}).get("unit", ""))
+                lots.setdefault(m["batch"], []).append(
+                    {"number": m["number"], "lot": m["lot"], "quantity": f"{fmt_qty(m['qty'])} {unit}".strip()})
         doc = f"{w['build_rw_document']}@{w['build_rw_revision']}" if w["build_rw_document"] and w["build_rw_revision"] else ""
         out = {"registered": [], "refused": []}
         for batch, units in sorted(batches.items()):
@@ -918,13 +929,14 @@ class Company:
             try:
                 got = client.register_units(self.register_txid(wid, batch), serials, model=units[0]["model"],
                                             name=units[0]["name"], built=units[0]["made"], document=doc,
-                                            evidence=f"work-order:{w['number']}")
+                                            evidence=f"work-order:{w['number']}",
+                                            **({"lots": lots[batch]} if lots.get(batch) else {}))
             except RevisionWorxError as e:
                 note = str(e) or "RevisionWorx refused."
                 if getattr(e, "kind", "") == "txid-used":
                     note = (f"RevisionWorx already has different units registered from this completion of {w['number']} "
-                            "(from another copy of this company file, or an older backup of it, say). Nothing was changed "
-                            "there; check the units in RevisionWorx.")
+                            "(from another copy of this company file, or an older backup of it, or before a part it used "
+                            "was renumbered, say). Nothing was changed there; check the units in RevisionWorx.")
                 pending = [u for u in units if not u["rw_unit"]]
                 with self.tx():
                     for u in pending:
